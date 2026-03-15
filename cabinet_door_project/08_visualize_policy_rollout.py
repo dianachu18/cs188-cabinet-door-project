@@ -4,6 +4,9 @@ Step 8: Visualize a Policy Rollout
 Loads a trained policy checkpoint from 06_train_policy.py and runs it
 live in the OpenCabinet environment so you can watch the robot.
 
+Supports both simple MLP and diffusion U-Net policies (auto-detected
+from checkpoint).
+
 This is your primary debugging tool: watch exactly where and why the policy
 fails — does it reach for the handle? Does it grasp? Does it pull correctly?
 
@@ -12,8 +15,11 @@ Two rendering modes:
   Off-screen (--offscreen) — renders to a video file, works without a display
 
 Usage:
-    # Watch live in a window (WSL/Linux) + save video
+    # Watch live in a window — MLP policy
     python 08_visualize_policy_rollout.py --checkpoint /tmp/cabinet_policy_checkpoints/best_policy.pt
+
+    # Watch live — diffusion policy (auto-detected)
+    python 08_visualize_policy_rollout.py --checkpoint /tmp/cabinet_diffusion_checkpoints/best_diffusion_policy.pt
 
     # Save to video only (no display needed — works headless / in notebooks)
     python 08_visualize_policy_rollout.py --checkpoint ... --offscreen
@@ -65,6 +71,7 @@ else:
 # ────────────────────────────────────────────────────────────────────────────
 
 import argparse
+import collections
 import time
 
 import numpy as np
@@ -73,15 +80,33 @@ import robosuite
 from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
 
+# Add diffusion_policy to path
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DP_ROOT = os.path.join(SCRIPT_DIR, "diffusion_policy")
+if DP_ROOT not in sys.path:
+    sys.path.insert(0, DP_ROOT)
 
-# ── Policy loading (identical to 07_evaluate_policy.py) ─────────────────────
+
+# ── Policy loading (supports both MLP and diffusion) ────────────────────────
 
 def load_policy(checkpoint_path, device):
-    """Load the SimplePolicy trained by 06_train_policy.py."""
+    """Load a policy checkpoint (MLP or Diffusion U-Net, auto-detected)."""
     import torch
     import torch.nn as nn
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    policy_type = ckpt.get("policy_type", "simple_mlp")
+
+    if policy_type == "diffusion_unet":
+        return _load_diffusion_policy(ckpt, device)
+    else:
+        return _load_simple_policy(ckpt, device)
+
+
+def _load_simple_policy(ckpt, device):
+    """Load the simple MLP policy."""
+    import torch.nn as nn
+
     state_dim = ckpt["state_dim"]
     action_dim = ckpt["action_dim"]
 
@@ -105,38 +130,267 @@ def load_policy(checkpoint_path, device):
     model = SimplePolicy(state_dim, action_dim).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, state_dim, action_dim, ckpt
+
+    return {
+        "type": "simple_mlp",
+        "model": model,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "ckpt": ckpt,
+    }
 
 
-def extract_state(obs, state_dim):
-    """Flatten non-image observations into a state vector of length state_dim."""
+def _load_diffusion_policy(ckpt, device):
+    """Load the diffusion U-Net policy."""
+    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+    from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+    from diffusion_policy.policy.diffusion_unet_lowdim_policy import (
+        DiffusionUnetLowdimPolicy,
+    )
+
+    cfg = ckpt["config"]
+    obs_dim = ckpt["obs_dim"]
+    action_dim = ckpt["action_dim"]
+
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=cfg["num_diffusion_iters"],
+        beta_schedule=cfg["beta_schedule"],
+        clip_sample=True,
+        prediction_type="epsilon",
+    )
+
+    unet = ConditionalUnet1D(
+        input_dim=action_dim,
+        global_cond_dim=obs_dim * cfg["n_obs_steps"],
+        diffusion_step_embed_dim=cfg["diffusion_step_embed_dim"],
+        down_dims=cfg["down_dims"],
+        kernel_size=cfg["kernel_size"],
+        n_groups=cfg["n_groups"],
+        cond_predict_scale=cfg["cond_predict_scale"],
+    )
+
+    policy = DiffusionUnetLowdimPolicy(
+        model=unet,
+        noise_scheduler=noise_scheduler,
+        horizon=cfg["horizon"],
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        n_action_steps=cfg["n_action_steps"],
+        n_obs_steps=cfg["n_obs_steps"],
+        num_inference_steps=cfg["num_inference_iters"],
+        obs_as_global_cond=True,
+        pred_action_steps_only=False,
+    )
+
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy = policy.to(device)
+    policy.eval()
+
+    num_params = sum(p.numel() for p in policy.parameters())
+    print(f"  Diffusion U-Net: {num_params:,} params ({num_params / 1e6:.1f}M)")
+    print(f"  Horizon: {cfg['horizon']}, Action steps: {cfg['n_action_steps']}, Obs steps: {cfg['n_obs_steps']}")
+
+    return {
+        "type": "diffusion_unet",
+        "model": policy,
+        "state_dim": obs_dim,
+        "action_dim": action_dim,
+        "obs_dim": obs_dim,
+        "n_obs_steps": cfg["n_obs_steps"],
+        "n_action_steps": cfg["n_action_steps"],
+        "ckpt": ckpt,
+    }
+
+
+class LiveHandleAugmenter:
+    """
+    Computes handle augmented features (11 dims) from the live MuJoCo sim,
+    matching what 05b_augment_handle_data.py bakes into the training data.
+    """
+
+    OPEN_THRESHOLD = 0.90
+
+    def __init__(self, env):
+        model = env.sim.model
+        self._model = model
+        self.handle_bodies = []
+        self.door_joints = []
+        self.handle_to_joint_map = {}
+
+        ep_meta = env.get_ep_meta()
+        fixture_refs = ep_meta.get("fixture_refs", {})
+        self.fixture_name = fixture_refs.get("fxtr")
+        if not self.fixture_name:
+            return
+
+        for i in range(model.nbody):
+            name = model.body(i).name
+            if self.fixture_name in name and "handle" in name:
+                self.handle_bodies.append(name)
+
+        for i in range(model.njnt):
+            name = model.joint(i).name
+            if self.fixture_name in name and "door" in name:
+                self.door_joints.append((name, i))
+
+        if len(self.handle_bodies) <= 1 or len(self.door_joints) <= 1:
+            self.handle_to_joint_map = {hb: self.door_joints for hb in self.handle_bodies}
+        else:
+            for hb in self.handle_bodies:
+                hb_l = hb.lower()
+                if "left" in hb_l:
+                    matched = [(j, i) for j, i in self.door_joints if "left" in j.lower()]
+                elif "right" in hb_l:
+                    matched = [(j, i) for j, i in self.door_joints if "right" in j.lower()]
+                else:
+                    matched = []
+                self.handle_to_joint_map[hb] = matched if matched else self.door_joints
+
+    def _door_openness(self, data, joints):
+        if not joints:
+            return 0.0
+        vals = []
+        for _, jidx in joints:
+            addr = self._model.joint(jidx).qposadr[0]
+            qpos = data.qpos[addr]
+            jmin, jmax = self._model.jnt_range[jidx]
+            if jmax - jmin > 1e-8:
+                norm = abs(qpos - jmin) / (jmax - jmin) if abs(jmin) < abs(jmax) else abs(qpos - jmax) / (jmax - jmin)
+            else:
+                norm = 0.0
+            vals.append(np.clip(norm, 0.0, 1.0))
+        return float(np.mean(vals))
+
+    def _hinge_direction(self, handle_body):
+        joints = self.handle_to_joint_map.get(handle_body, [])
+        if not joints:
+            return 0.0
+        _, jidx = joints[0]
+        jmin, jmax = self._model.jnt_range[jidx]
+        return 1.0 if abs(jmin) < abs(jmax) else -1.0
+
+    def compute(self, env):
+        if not self.handle_bodies:
+            return np.zeros(11, dtype=np.float32)
+        data = env.sim.data
+        eef_pos = data.body("gripper0_right_eef").xpos.copy()
+        per_door = {hb: self._door_openness(data, self.handle_to_joint_map[hb]) for hb in self.handle_bodies}
+        active = [hb for hb in self.handle_bodies if per_door[hb] < self.OPEN_THRESHOLD]
+        candidates = active if active else self.handle_bodies
+        dists = [np.linalg.norm(data.body(hb).xpos - eef_pos) for hb in candidates]
+        target = candidates[int(np.argmin(dists))]
+        handle_pos = data.body(target).xpos.copy().astype(np.float32)
+        handle_to_eef = (handle_pos - eef_pos).astype(np.float32)
+        openness = np.array([per_door[target]], dtype=np.float32)
+        xmat = data.body(target).xmat.reshape(3, 3)
+        handle_xaxis = xmat[:, 0].copy().astype(np.float32)
+        hinge_dir = np.array([self._hinge_direction(target)], dtype=np.float32)
+        return np.concatenate([handle_pos, handle_to_eef, openness, handle_xaxis, hinge_dir])
+
+
+def extract_state(obs, state_dim, augmented_features=None):
+    """Extract state vector matching the exact training feature order.
+
+    Raw state (16 dims) from robocasa LeRobot conversion:
+        [robot0_base_pos(3), robot0_base_quat(4), robot0_base_to_eef_pos(3),
+         robot0_base_to_eef_quat(4), robot0_gripper_qpos(2)]
+    Then augmented features (11 dims) from LiveHandleAugmenter:
+        [handle_pos(3), handle_to_eef(3), openness(1), xaxis(3), hinge(1)]
+    """
+    RAW_STATE_KEYS = [
+        "robot0_base_pos",
+        "robot0_base_quat",
+        "robot0_base_to_eef_pos",
+        "robot0_base_to_eef_quat",
+        "robot0_gripper_qpos",
+    ]
+
     parts = []
-    for key in sorted(obs.keys()):
-        val = obs[key]
-        if isinstance(val, np.ndarray) and not key.endswith("_image"):
-            parts.append(val.flatten())
+    for key in RAW_STATE_KEYS:
+        if key in obs and isinstance(obs[key], np.ndarray):
+            parts.append(obs[key].flatten())
     if not parts:
         return np.zeros(state_dim, dtype=np.float32)
-    state = np.concatenate(parts).astype(np.float32)
-    if len(state) < state_dim:
-        state = np.pad(state, (0, state_dim - len(state)))
-    elif len(state) > state_dim:
-        state = state[:state_dim]
+
+    raw_state = np.concatenate(parts).astype(np.float32)
+
+    if augmented_features is not None:
+        raw_dim = state_dim - len(augmented_features)
+        if len(raw_state) > raw_dim:
+            raw_state = raw_state[:raw_dim]
+        elif len(raw_state) < raw_dim:
+            raw_state = np.pad(raw_state, (0, raw_dim - len(raw_state)))
+        state = np.concatenate([raw_state, augmented_features])
+    else:
+        if len(raw_state) < state_dim:
+            raw_state = np.pad(raw_state, (0, state_dim - len(raw_state)))
+        elif len(raw_state) > state_dim:
+            raw_state = raw_state[:state_dim]
+        state = raw_state
+
     return state
+
+
+def get_action(policy_info, obs, obs_history, action_buffer, augmenter=None, env=None):
+    """
+    Get the next action from either policy type.
+
+    For MLP: single forward pass per step.
+    For diffusion: runs inference when action_buffer is empty, then
+    pops from the buffer (action chunking).
+    """
+    import torch
+
+    state_dim = policy_info["state_dim"]
+    aug_feats = augmenter.compute(env) if (augmenter and augmenter.handle_bodies and env) else None
+    state = extract_state(obs, state_dim, augmented_features=aug_feats)
+
+    if policy_info["type"] == "simple_mlp":
+        model = policy_info["model"]
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            action = model(
+                torch.from_numpy(state).unsqueeze(0).to(device)
+            ).cpu().numpy().squeeze(0)
+        return action
+
+    # Diffusion policy with action chunking
+    model = policy_info["model"]
+    device = model.device
+    n_obs = policy_info["n_obs_steps"]
+
+    obs_history.append(state)
+
+    if len(action_buffer) == 0:
+        # Need to re-plan: run diffusion inference
+        while len(obs_history) < n_obs:
+            obs_history.appendleft(obs_history[0])
+
+        obs_seq = np.stack(list(obs_history), axis=0)  # (n_obs, obs_dim)
+        obs_tensor = (
+            torch.from_numpy(obs_seq).float().unsqueeze(0).to(device)
+        )  # (1, n_obs, obs_dim)
+
+        with torch.no_grad():
+            result = model.predict_action({"obs": obs_tensor})
+            action_chunk = result["action"].cpu().numpy().squeeze(0)
+
+        for a in action_chunk:
+            action_buffer.append(a)
+
+    return action_buffer.popleft()
 
 
 # ── On-screen rollout ────────────────────────────────────────────────────────
 
-def run_onscreen(model, state_dim, action_dim, args):
+def run_onscreen(policy_info, args):
     """
     Run the policy with an interactive MuJoCo viewer window.
 
     The viewer opens automatically; you can pan/zoom/rotate the camera
     with the mouse while the robot executes the policy.
     """
-    import torch
-
-    device = next(model.parameters()).device
+    action_dim = policy_info["action_dim"]
 
     env = robosuite.make(
         env_name="OpenCabinet",
@@ -165,22 +419,29 @@ def run_onscreen(model, state_dim, action_dim, args):
 
         success = False
         hold_count = 0
+        obs_history = collections.deque(maxlen=policy_info.get("n_obs_steps", 1))
+        action_buffer = collections.deque()
+        augmenter = LiveHandleAugmenter(env)
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                action = model(
-                    torch.from_numpy(state).unsqueeze(0).to(device)
-                ).cpu().numpy().squeeze(0)
+            action = get_action(policy_info, obs, obs_history, action_buffer,
+                                augmenter=augmenter, env=env)
 
-            # Pad / trim to environment's expected action dimension
+            # Reorder action from LeRobot/parquet format to env/HDF5 format
+            env_action = np.zeros(12, dtype=np.float32)
+            env_action[0:3] = action[5:8]    # eef_position
+            env_action[3:6] = action[8:11]   # eef_rotation
+            env_action[6:7] = action[11:12]  # gripper_close
+            env_action[7:11] = action[0:4]   # base_motion
+            env_action[11:12] = action[4:5]  # control_mode
+
             env_dim = env.action_dim
-            if len(action) < env_dim:
-                action = np.pad(action, (0, env_dim - len(action)))
-            elif len(action) > env_dim:
-                action = action[:env_dim]
+            if len(env_action) < env_dim:
+                env_action = np.pad(env_action, (0, env_dim - len(env_action)))
+            elif len(env_action) > env_dim:
+                env_action = env_action[:env_dim]
 
-            obs, reward, done, info = env.step(action)
+            obs, reward, done, info = env.step(env_action)
 
             # Print a brief status every 20 steps
             if step % 20 == 0:
@@ -214,7 +475,7 @@ def run_onscreen(model, state_dim, action_dim, args):
 
 # ── Off-screen rollout with video ────────────────────────────────────────────
 
-def run_offscreen(model, state_dim, action_dim, args):
+def run_offscreen(policy_info, args):
     """
     Run the policy headlessly and save a side-by-side annotated video.
 
@@ -222,11 +483,8 @@ def run_offscreen(model, state_dim, action_dim, args):
     diagnostics (step count, reward, success flag) are printed to the
     terminal.
     """
-    import torch
     import imageio
     from robocasa.utils.env_utils import create_env
-
-    device = next(model.parameters()).device
 
     video_dir = os.path.dirname(args.video_path)
     if video_dir:
@@ -255,21 +513,29 @@ def run_offscreen(model, state_dim, action_dim, args):
         success = False
         hold_count = 0
         ep_frames = []
+        obs_history = collections.deque(maxlen=policy_info.get("n_obs_steps", 1))
+        action_buffer = collections.deque()
+        augmenter = LiveHandleAugmenter(env)
 
         for step in range(args.max_steps):
-            state = extract_state(obs, state_dim)
-            with torch.no_grad():
-                action = model(
-                    torch.from_numpy(state).unsqueeze(0).to(device)
-                ).cpu().numpy().squeeze(0)
+            action = get_action(policy_info, obs, obs_history, action_buffer,
+                                augmenter=augmenter, env=env)
+
+            # Reorder action from LeRobot/parquet format to env/HDF5 format
+            env_action = np.zeros(12, dtype=np.float32)
+            env_action[0:3] = action[5:8]    # eef_position
+            env_action[3:6] = action[8:11]   # eef_rotation
+            env_action[6:7] = action[11:12]  # gripper_close
+            env_action[7:11] = action[0:4]   # base_motion
+            env_action[11:12] = action[4:5]  # control_mode
 
             env_dim = env.action_dim
-            if len(action) < env_dim:
-                action = np.pad(action, (0, env_dim - len(action)))
-            elif len(action) > env_dim:
-                action = action[:env_dim]
+            if len(env_action) < env_dim:
+                env_action = np.pad(env_action, (0, env_dim - len(env_action)))
+            elif len(env_action) > env_dim:
+                env_action = env_action[:env_dim]
 
-            obs, reward, done, info = env.step(action)
+            obs, reward, done, info = env.step(env_action)
 
             # Render from the agent view camera
             frame = env.sim.render(
@@ -383,11 +649,13 @@ def main():
         sys.exit(1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, state_dim, action_dim, ckpt = load_policy(args.checkpoint, device)
+    policy_info = load_policy(args.checkpoint, device)
+    ckpt = policy_info["ckpt"]
 
     print(f"Checkpoint: {args.checkpoint}")
+    print(f"  Type:  {policy_info['type']}")
     print(f"  Epoch {ckpt['epoch']}, loss {ckpt['loss']:.6f}")
-    print(f"  State dim: {state_dim},  Action dim: {action_dim}")
+    print(f"  State dim: {policy_info['state_dim']},  Action dim: {policy_info['action_dim']}")
     print(f"  Device: {device}")
     print()
 
@@ -400,11 +668,11 @@ def main():
     print()
 
     if args.offscreen:
-        run_offscreen(model, state_dim, action_dim, args)
+        run_offscreen(policy_info, args)
     else:
         print("Opening viewer window...")
         print("  Tip: orbit the camera with the mouse to see the gripper.\n")
-        run_onscreen(model, state_dim, action_dim, args)
+        run_onscreen(policy_info, args)
 
     print("\nDone.")
 

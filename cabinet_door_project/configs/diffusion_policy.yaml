@@ -1,49 +1,50 @@
-# Training configuration for the simple behavior cloning policy
-# For the full Diffusion Policy, use the official repo config instead.
+# Configuration for Diffusion Policy training (1D U-Net, low-dim state)
+# Used by: 09_train_lowdim_unet.py
 
+# ---------------------------------------------------------------
+# Temporal parameters
+# ---------------------------------------------------------------
+horizon: 16              # Total prediction horizon (future timesteps)
+n_obs_steps: 2           # Number of observation steps as context
+n_action_steps: 8        # Number of actions to execute per planning step
+
+# ---------------------------------------------------------------
+# Diffusion parameters
+# ---------------------------------------------------------------
+num_diffusion_iters: 100          # DDPM training timesteps
+num_inference_iters: 16           # Denoising steps at inference (can be << train)
+beta_schedule: squaredcos_cap_v2  # Noise schedule
+
+# ---------------------------------------------------------------
+# 1D U-Net architecture
+# ---------------------------------------------------------------
+down_dims: [256, 512, 1024]    # Channel dims at each U-Net level (~15M params)
+kernel_size: 3
+n_groups: 8                    # GroupNorm groups
+diffusion_step_embed_dim: 256  # Sinusoidal timestep embedding dim
+cond_predict_scale: true       # FiLM conditioning (scale + bias)
+
+# ---------------------------------------------------------------
 # Training parameters
-epochs: 100
+# ---------------------------------------------------------------
+epochs: 500
 batch_size: 64
 learning_rate: 0.0001
+weight_decay: 0.000001
+ema_decay: 0.995               # Exponential moving average for model weights
+lr_warmup_steps: 500           # Linear warmup before cosine decay
+grad_clip_norm: 1.0            # Gradient clipping
 
+# ---------------------------------------------------------------
 # Checkpoint saving
-checkpoint_dir: /tmp/cabinet_policy_checkpoints
+# ---------------------------------------------------------------
+checkpoint_dir: /tmp/cabinet_diffusion_checkpoints
 
 # ---------------------------------------------------------------
-# Reference: Official Diffusion Policy config keys
-# (used when training with the robocasa-benchmark/diffusion_policy repo)
-#
-# task: robocasa/OpenCabinet
-# horizon: 16             # prediction horizon (number of future actions)
-# n_obs_steps: 2          # number of observation steps as context
-# n_action_steps: 8       # number of actions to execute per step
-#
-# policy:
-#   type: diffusion_transformer
-#   n_layers: 8
-#   n_heads: 4
-#   d_model: 256
-#   noise_scheduler: ddpm
-#   num_diffusion_iters: 100
-#   num_inference_iters: 16
-#
-# training:
-#   batch_size: 192
-#   lr: 1.0e-4
-#   weight_decay: 1.0e-6
-#   num_epochs: 3000
-#   lr_scheduler: cosine
-#   lr_warmup_steps: 500
-#
-# observation:
-#   image_keys:
-#     - robot0_agentview_left_image
-#     - robot0_agentview_right_image
-#     - robot0_eye_in_hand_image
-#   low_dim_keys:
-#     - robot0_gripper_qpos
-#     - robot0_base_pos
-#     - robot0_base_quat
-#     - robot0_base_to_eef_pos
-#     - robot0_base_to_eef_quat
+# Simple MLP policy config (used by 06_train_policy.py)
+# Kept for backward compatibility
 # ---------------------------------------------------------------
+# epochs: 100
+# batch_size: 64
+# learning_rate: 0.0001
+# checkpoint_dir: /tmp/cabinet_policy_checkpoints
