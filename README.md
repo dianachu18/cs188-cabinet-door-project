@@ -1,352 +1,395 @@
-# Cabinet Door Opening Robot - CS 188 Starter Project
+# Diffusion Policy for Robotic Cabinet Door Opening
 
-### Disclaimer
+### CS 188 — Introduction to Robotics | UCLA | Final Project
 
-This project was designed for CS 188 - Intro to Robotics as a template starter project. If you have any issues with the codebase, please email me at holdengs @ cs.ucla.edu!
+A diffusion-based imitation learning system that trains a robot to open kitchen cabinet doors in the [RoboCasa](https://robocasa.ai/) simulation environment. The policy uses a **1D Convolutional U-Net** with **action chunking** and **DDPM noise scheduling** to learn from 107 human demonstrations, achieving **50% success rate** on the OpenCabinet task.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Results](#results)
+- [Installation](#installation)
+- [Project Structure](#project-structure)
+- [Pipeline](#pipeline)
+  - [Step 0–2: Environment Setup & Exploration](#step-0-2-environment-setup--exploration)
+  - [Step 3–4: Data Collection](#step-3-4-data-collection)
+  - [Step 5: Data Augmentation](#step-5-data-augmentation)
+  - [Step 6: Training](#step-6-training)
+  - [Step 7: Evaluation](#step-7-evaluation)
+  - [Step 8: Visualization](#step-8-visualization)
+- [Key Design Decisions](#key-design-decisions)
+- [Troubleshooting](#troubleshooting)
+- [Acknowledgments](#acknowledgments)
+
+---
 
 ## Overview
 
-In this project you will build a robot that learns to open kitchen cabinet doors
-using **RoboCasa365**, a large-scale simulation benchmark for everyday robot
-tasks. You will progress from understanding the simulation environment, to
-collecting demonstrations, to training a neural-network policy that controls the
-robot autonomously.
+**Task:** A PandaOmron mobile manipulator (7-DOF Franka Panda arm + Omron wheeled base) must locate and pull open a hinged cabinet door across diverse procedurally generated kitchen scenes.
 
-### What you will learn
+**Approach:** We train a **Diffusion Policy** — a denoising diffusion probabilistic model (DDPM) that generates action sequences conditioned on robot observations. Instead of predicting a single action per timestep, the policy predicts a *horizon* of 16 future actions and executes them in short chunks, enabling smooth and temporally coherent manipulation behavior.
 
-1. How robotic manipulation environments are structured (MuJoCo + robosuite + RoboCasa)
-2. How the `OpenCabinet` task works -- sensors, actions, success criteria
-3. How to collect and use demonstration datasets (human + MimicGen)
-4. How to train a behavior-cloning policy from demonstrations
-5. How to evaluate your trained policy in simulation
+**Key features:**
+- 1D Convolutional U-Net (`ConditionalUnet1D`) with ~43M parameters
+- Action chunking: predict 16 steps, execute 8
+- Live handle augmentation: 11 extra observation dims (handle position, door openness, hinge direction)
+- EMA weight averaging (decay=0.995) for stable training
+- Cosine beta schedule (`squaredcos_cap_v2`) for diffusion noise
 
-### The robot
+---
 
-We use the **PandaOmron** mobile manipulator -- a Franka Panda 7-DOF arm
-mounted on an Omron wheeled base with a torso lift joint. This is the default
-and best-supported robot in RoboCasa.
+## Architecture
+
+```
+Observations (27-dim)                    Actions (12-dim x 16 horizon)
+─────────────────────                    ────────────────────────────
+ Proprioception (16):                     End-effector delta pos (3)
+   gripper_qpos (2)                       End-effector delta rot (3)
+   base_pos (3)                           Gripper open/close (1)
+   base_quat (4)                          Base motion (4)
+   base_to_eef_pos (3)                    Control mode (1)
+   base_to_eef_quat (4)
+                           ┌───────────────────────────┐
+ Handle features (11):     │   ConditionalUnet1D       │
+   handle_pos (3)          │   (1D Conv, ~43M params)  │
+   handle_to_eef_pos (3)   │                           │
+   door_openness (1)  ───▶ │   Encoder: [128,256,512]  │ ───▶ Denoised actions
+   handle_xaxis (3)        │   Kernel size: 3          │      (12-dim x 16 steps)
+   hinge_direction (1)     │   Groups: 8               │
+                           │   Diffusion steps: 100    │
+                           │   Inference steps: 16     │
+                           └───────────────────────────┘
+
+                    DDPM Training                    Inference
+                    ─────────────                    ─────────
+                    1. Sample action chunk            1. Start from random noise
+                    2. Add noise (step t)             2. Denoise 16 iterations
+                    3. Predict noise ε_θ              3. Execute first 2 actions
+                    4. MSE loss on noise              4. Re-observe, repeat
+```
+
+---
+
+## Results
+
+| Metric | Value |
+|--------|-------|
+| Success rate (90% door threshold) | **50%** |
+| Best episode door openness | **91.4%** |
+| Average max door openness | ~52.3% |
+| Model parameters | 43.0M |
+| Training epochs | 500 |
+| Training loss (best) | 0.002275 |
+| Training time | ~180 min on 5080 GPU |
+
+The robot successfully learns to:
+1. Navigate toward the cabinet
+2. Locate the door handle using augmented features
+3. Grasp and pull the handle to open the door
 
 ---
 
 ## Installation
 
-Run the install script (works on **macOS** and **WSL/Linux**):
+### Prerequisites
+- Python 3.10+
+- macOS or Linux/WSL
+- ~10 GB disk space for kitchen assets
+
+### Quick Start
 
 ```bash
+# Clone the repository
+git clone <repo-url>
+cd cs188-cabinet-door-project
+
+# Run the install script
 ./install.sh
+
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Verify installation
+cd cabinet_door_project
+python 00_verify_installation.py
 ```
 
-This will:
+The install script will:
 - Create a Python virtual environment (`.venv`)
 - Clone and install robosuite and robocasa
 - Install all Python dependencies (PyTorch, numpy, matplotlib, etc.)
 - Download RoboCasa kitchen assets (~10 GB)
 
-After installation, activate the environment:
-
-```bash
-source .venv/bin/activate
-```
-
-Then verify everything works:
-
-```bash
-cd cabinet_door_project
-python 00_verify_installation.py
-```
-
-> **macOS note:** Scripts that open a rendering window (03, 05) require
-> `mjpython` instead of `python`. The install script will remind you of this.
+> **macOS note:** Scripts that open a rendering window (03, 05, 08 on-screen mode) require `mjpython` instead of `python`.
 
 ---
 
 ## Project Structure
 
 ```
-cabinet_door_project/
-  00_verify_installation.py      # Check that everything is installed correctly
-  01_explore_environment.py      # Create the OpenCabinet env, inspect observations/actions
-  02_random_rollouts.py          # Run random actions, save video, understand the task
-  03_teleop_collect_demos.py     # Teleoperate the robot to collect your own demonstrations
-  04_download_dataset.py         # Download the pre-collected OpenCabinet dataset
-  05_playback_demonstrations.py  # Play back demonstrations to see expert behavior
-  06_train_policy.py             # Train a simple MLP behavior-cloning policy
-  07_evaluate_policy.py          # Evaluate your trained policy in simulation
-  08_visualize_policy_rollout.py # Visualize a rollout of your policy in RoboCasa
-  configs/
-    diffusion_policy.yaml        # Training hyperparameters
-  notebook.ipynb                 # Interactive Jupyter notebook companion
-install.sh                       # Installation script (macOS + WSL/Linux)
-README.md                        # This file
+cs188-cabinet-door-project/
+├── README.md
+├── install.sh                              # Installation script
+├── pyproject.toml
+├── main.py
+│
+├── cabinet_door_project/
+│   ├── 00_verify_installation.py           # Verify MuJoCo + RoboCasa setup
+│   ├── 01_explore_environment.py           # Inspect observation/action spaces
+│   ├── 02_random_rollouts.py               # Random agent baseline + video
+│   ├── 03_teleop_collect_demos.py          # Keyboard teleoperation for demos
+│   ├── 04_download_dataset.py              # Download OpenCabinet demonstrations
+│   ├── 05_playback_demonstrations.py       # Replay expert demonstrations
+│   ├── 05b_augment_handle_data.py          # Add handle features to dataset
+│   ├── 06_train_policy.py                  # Train diffusion policy (local)
+│   ├── 07_evaluate_policy.py               # Evaluate policy + door openness
+│   ├── 08_visualize_policy_rollout.py      # Record per-episode rollout videos
+│   │
+│   ├── configs/
+│   │   └── diffusion_policy.yaml           # Training hyperparameters
+│   ├── diffusion_policy/                   # ConditionalUnet1D, normalizer, etc.
+│   ├── train_diffusion_colab.ipynb         # Google Colab training notebook
+│   └── notebook.ipynb                      # Interactive exploration notebook
+│
+├── robocasa/                               # RoboCasa simulation framework
+└── robosuite/                              # Robot control backend
 ```
 
 ---
 
-## Step-by-Step Guide
+## Pipeline
 
-### Step 0: Verify Installation
+### Step 0–2: Environment Setup & Exploration
 
 ```bash
-python 00_verify_installation.py
+python 00_verify_installation.py      # Check MuJoCo, robosuite, RoboCasa
+python 01_explore_environment.py      # Print obs/action space details
+python 02_random_rollouts.py          # Random agent → /tmp/cabinet_random_rollouts.mp4
 ```
 
-This checks that MuJoCo, robosuite, RoboCasa, and all dependencies are
-correctly installed and that the `OpenCabinet` environment can be created.
-
-### Step 1: Explore the Environment
+### Step 3–4: Data Collection
 
 ```bash
-python 01_explore_environment.py
-```
+# Collect your own demos via keyboard teleoperation (Mac: use mjpython)
+mjpython 03_teleop_collect_demos.py
 
-This script creates the `OpenCabinet` environment and prints detailed
-information about:
-- **Observation space**: what the robot sees (camera images, joint positions,
-  gripper state, base pose)
-- **Action space**: what the robot can do (arm movement, gripper open/close,
-  base motion, control mode)
-- **Task description**: the natural language instruction for the episode
-- **Success criteria**: how the environment determines task completion
-
-### Step 2: Random Rollouts
-
-```bash
-python 02_random_rollouts.py
-```
-
-Runs the robot with random actions to see what happens (spoiler: nothing
-useful, but it helps you understand the action space). Saves a video to
-`/tmp/cabinet_random_rollouts.mp4`.
-
-### Step 3: Teleoperate and Collect Demonstrations
-
-```bash
-# Mac users: use mjpython instead of python
-python 03_teleop_collect_demos.py
-```
-
-Control the robot yourself using the keyboard to open cabinet doors. This
-gives you intuition for the task difficulty and generates demonstration data.
-
-**Keyboard controls:**
-| Key | Action |
-|-----|--------|
-| Ctrl+q | Reset simulation |
-| spacebar | Toggle gripper (open/close) |
-| up-right-down-left | Move horizontally in x-y plane |
-| .-; | Move vertically |
-| o-p | Rotate (yaw) |
-| y-h | Rotate (pitch) |
-| e-r | Rotate (roll) |
-| b | Toggle arm/base mode (if applicable) |
-| s | Switch active arm (if multi-armed robot) |
-| = | Switch active robot (if multi-robot environment) |              
-
-### Step 4: Download Pre-collected Dataset
-
-```bash
+# Or download pre-collected 50-episode OpenCabinet dataset
 python 04_download_dataset.py
 ```
 
-Downloads the official OpenCabinet demonstration dataset from the RoboCasa
-servers. This includes both human demonstrations and MimicGen-expanded data
-across diverse kitchen scenes.
+**Keyboard controls for teleoperation:**
 
-### Step 5: Play Back Demonstrations
+| Key | Action |
+|-----|--------|
+| `Ctrl+q` | Reset simulation |
+| `spacebar` | Toggle gripper |
+| `↑ → ↓ ←` | Move in x-y plane |
+| `. ;` | Move vertically |
+| `o p` | Rotate (yaw) |
+| `y h` | Rotate (pitch) |
+| `e r` | Rotate (roll) |
+| `b` | Toggle arm/base mode |
+
+### Step 5: Data Augmentation
 
 ```bash
-python 05_playback_demonstrations.py
+python 05_playback_demonstrations.py    # Visualize expert demos
+python 05b_augment_handle_data.py       # Add 11-dim handle features
 ```
 
-Visualize the downloaded demonstrations to see how an expert opens cabinet
-doors. This is the data your policy will learn from.
+`05b` replays saved MuJoCo states to extract runtime features not stored in the original parquet files:
 
-### Step 6: Train a Policy
+| Feature | Dims | Description |
+|---------|------|-------------|
+| `handle_pos` | 3 | Handle 3D world position |
+| `handle_to_eef_pos` | 3 | Handle relative to end-effector |
+| `door_openness` | 1 | Normalized joint state (0=closed, 1=open) |
+| `handle_xaxis` | 3 | Door facing direction |
+| `hinge_direction` | 1 | Hinge side indicator (+1 right, -1 left) |
 
+### Step 6: Training
+
+**Local training:**
 ```bash
+# Diffusion policy (recommended)
+python 06_train_policy.py --diffusion
+
+# With custom hyperparameters
+python 06_train_policy.py --diffusion --epochs 350 --batch_size 128
+
+# Quick test with small model
+python 06_train_policy.py --diffusion --fast
+
+# Simple MLP baseline (educational only)
 python 06_train_policy.py
 ```
 
-Trains a simple MLP behavior-cloning policy on low-dimensional state-action
-pairs from the demonstration data. This is meant to illustrate the
-data-loading → training → checkpoint pipeline, not to produce a policy that
-can reliably solve the task.
 
-For a policy that actually works, use one of the official training repos:
+**Default hyperparameters:**
+
+| Parameter | Value |
+|-----------|-------|
+| Horizon | 16 |
+| Observation steps | 2 |
+| Action steps (executed) | 8 |
+| Diffusion iterations (train) | 100 |
+| Diffusion iterations (inference) | 16 |
+| Beta schedule | `squaredcos_cap_v2` |
+| U-Net channels | [128, 256, 512] |
+| Kernel size | 3 |
+| Epochs | 500 |
+| Batch size | 64 |
+| Learning rate | 1e-4 |
+| EMA decay | 0.995 |
+
+Checkpoints are saved to `/tmp/cabinet_diffusion_checkpoints/`.
+
+### Step 7: Evaluation
 
 ```bash
-# Diffusion Policy (recommended for single-task)
-git clone https://github.com/robocasa-benchmark/diffusion_policy
-cd diffusion_policy && pip install -e .
-python train.py --config-name=train_diffusion_transformer_bs192 task=robocasa/OpenCabinet
+# Basic evaluation (20 episodes)
+python 07_evaluate_policy.py \
+    --checkpoint /tmp/cabinet_diffusion_checkpoints/best_diffusion_policy.pt
+
+# Relaxed door-open threshold
+python 07_evaluate_policy.py \
+    --checkpoint best_diffusion_policy.pt \
+    --threshold 0.30
+
+# More episodes, save video
+python 07_evaluate_policy.py \
+    --checkpoint best_diffusion_policy.pt \
+    --num_rollouts 20 \
+    --threshold 0.30 \
+    --video_path /tmp/eval.mp4
 ```
 
-You can also print setup instructions for Diffusion Policy, pi-0, and GR00T
-directly from the script:
+The evaluator reads door joint states directly from MuJoCo simulation data, tracking `max_door_openness` per episode and reporting average/best values.
+
+### Step 8: Visualization
 
 ```bash
-python 06_train_policy.py --use_diffusion_policy
+# Save per-episode videos (off-screen, works without display)
+python 08_visualize_policy_rollout.py \
+    --checkpoint best_diffusion_policy.pt \
+    --offscreen
+
+# Custom settings
+python 08_visualize_policy_rollout.py \
+    --checkpoint best_diffusion_policy.pt \
+    --offscreen \
+    --num_episodes 5 \
+    --video_dir ./my_videos
+
+# Live interactive viewer (Mac: use mjpython)
+mjpython 08_visualize_policy_rollout.py \
+    --checkpoint best_diffusion_policy.pt
 ```
 
-### Step 7: Evaluate Your Policy
-
-```bash
-python 07_evaluate_policy.py --checkpoint path/to/checkpoint.pt
-```
-
-Runs your trained policy in the simulation environment and reports success
-rate across multiple episodes and kitchen scenes.
+Saves individual episode videos (`episode_01.mp4`, etc.) and a combined `all_episodes.mp4` to `--video_dir` (default: `./rollout_videos/`).
 
 ---
 
-## Key Concepts
+## Key Design Decisions
 
-### The OpenCabinet Task
+### Why Diffusion Policy over vanilla BC?
+Standard behavior cloning with MSE loss averages over multimodal demonstrations (e.g., approaching the handle from the left vs. right), producing ineffective mean actions. Diffusion models naturally handle multimodality by learning the full action distribution.
 
-- **Goal**: Open a kitchen cabinet door
-- **Fixture**: `HingeCabinet` (a cabinet with hinged doors)
-- **Initial state**: Cabinet door is closed; robot is positioned nearby
-- **Success**: `fixture.is_open(env)` returns `True`
-- **Horizon**: 500 timesteps at 20 Hz control frequency (25 seconds)
-- **Scene variety**: 2,500+ kitchen layouts/styles for generalization
+### Why Action Chunking?
+Single-step action prediction produces jerky, temporally incoherent behavior. Predicting a horizon of 16 actions and executing 2 at a time (then replanning) yields smooth trajectories while maintaining reactivity to the environment.
 
-### Observation Space (PandaOmron)
+### Why Handle Augmentation?
+The raw proprioceptive observations (16 dims) don't tell the robot where the cabinet handle is. The 11-dim handle features from `05b` provide the critical spatial relationship between the end-effector and the grasp target.
 
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `robot0_agentview_left_image` | (256, 256, 3) | Left shoulder camera |
-| `robot0_agentview_right_image` | (256, 256, 3) | Right shoulder camera |
-| `robot0_eye_in_hand_image` | (256, 256, 3) | Wrist-mounted camera |
-| `robot0_gripper_qpos` | (2,) | Gripper finger positions |
-| `robot0_base_pos` | (3,) | Base position (x, y, z) |
-| `robot0_base_quat` | (4,) | Base orientation quaternion |
-| `robot0_base_to_eef_pos` | (3,) | End-effector pos relative to base |
-| `robot0_base_to_eef_quat` | (4,) | End-effector orientation relative to base |
+### Action Reordering
+LeRobot parquet files store actions in a different order than what `robosuite` expects. The evaluation and visualization scripts include `reorder_action()` to handle this mismatch — a critical detail for correct execution.
 
-### Action Space (PandaOmron)
-
-| Key | Dim | Description |
-|-----|-----|-------------|
-| `end_effector_position` | 3 | Delta (dx, dy, dz) for the end-effector |
-| `end_effector_rotation` | 3 | Delta rotation (axis-angle) |
-| `gripper_close` | 1 | 0 = open, 1 = close |
-| `base_motion` | 4 | (forward, side, yaw, torso) |
-| `control_mode` | 1 | 0 = arm control, 1 = base control |
-
-### Dataset Format (LeRobot)
-
-Datasets are stored in LeRobot format:
-```
-dataset/
-  meta/           # Episode metadata (task descriptions, camera info)
-  videos/         # MP4 videos from each camera
-  data/           # Parquet files with actions, states, rewards
-  extras/         # Per-episode metadata
-```
+### Door State Monitoring
+The default `env.fxtr.get_joint_state()` API was unreliable. We implemented `get_door_joint_states()` to read door hinge joint positions directly from MuJoCo's `sim.data.qpos`, providing accurate normalized door openness tracking.
 
 ---
 
-## Architecture Diagram
+## Observation & Action Spaces
 
-```
-                    RoboCasa Stack
-                    ==============
+### Observation Space (27-dim)
 
-  +-------------------+     +-------------------+
-  |   Kitchen Scene   |     |   OpenCabinet     |
-  |  (2500+ layouts)  |     |   (Task Logic)    |
-  +--------+----------+     +--------+----------+
-           |                         |
-           v                         v
-  +------------------------------------------------+
-  |              Kitchen Base Class                 |
-  |  - Fixture management (cabinets, fridges, etc)  |
-  |  - Object placement (bowls, cups, etc)          |
-  |  - Robot positioning                            |
-  +------------------------+-----------------------+
-                           |
-                           v
-  +------------------------------------------------+
-  |              robosuite (Backend)                |
-  |  - MuJoCo physics simulation                   |
-  |  - Robot models (PandaOmron, GR1, Spot, ...)   |
-  |  - Controller framework                        |
-  +------------------------+-----------------------+
-                           |
-                           v
-  +------------------------------------------------+
-  |              MuJoCo 3.3.1 (Physics)            |
-  |  - Contact dynamics, rendering, sensors        |
-  +------------------------------------------------+
-```
+| Component | Dims | Source |
+|-----------|------|--------|
+| `gripper_qpos` | 2 | Gripper finger positions |
+| `base_pos` | 3 | Mobile base position (x, y, z) |
+| `base_quat` | 4 | Mobile base orientation |
+| `base_to_eef_pos` | 3 | End-effector position relative to base |
+| `base_to_eef_quat` | 4 | End-effector orientation relative to base |
+| `handle_pos` | 3 | Cabinet handle world position (augmented) |
+| `handle_to_eef_pos` | 3 | Handle-to-EEF vector (augmented) |
+| `door_openness` | 1 | Normalized door joint state (augmented) |
+| `handle_xaxis` | 3 | Door facing direction (augmented) |
+| `hinge_direction` | 1 | Hinge side: +1 or -1 (augmented) |
+
+### Action Space (12-dim)
+
+| Component | Dims | Description |
+|-----------|------|-------------|
+| End-effector delta position | 3 | (dx, dy, dz) |
+| End-effector delta rotation | 3 | Axis-angle |
+| Gripper | 1 | 0=open, 1=close |
+| Base motion | 4 | (forward, lateral, yaw, torso) |
+| Control mode | 1 | 0=arm, 1=base |
 
 ---
 
-## Research Directions
+## Software Stack
 
-The MLP baseline in `06_train_policy.py` is intentionally simple — it
-demonstrates the pipeline but will basically always fail. Here are three
-fun directions to improve the model:
-
-### Minimal Diffusion Policy
-
-Replace the direct-regression MLP with a diffusion-based action generator.
-The core loop is to corrupt ground-truth actions with Gaussian noise,
-train the network to predict that noise conditioned on the current state, and
-at inference iteratively denoise from pure noise to produce an action. This
-properly handles multi-modal demonstrations (e.g., approaching the handle from
-the left vs. right) that MSE loss averages into useless mean actions.
-See [Chi et al., 2023](https://diffusion-policy.cs.columbia.edu/) for the
-full approach — a minimal version can be built in ~100 lines on top of the
-existing MLP backbone.
-
-### DAgger (Online Correction)
-
-Script 03 already provides keyboard teleoperation. I have it set up with a DAgger mode that may or may not be kinda buggy. Use it to close the loop:
-train a policy, roll it out, then have a human take over and correct the robot
-whenever it fails. Aggregate these corrections into the training set and
-retrain. This directly attacks distribution shift — the fundamental reason
-offline BC degrades at test time — by collecting data in the states the policy
-actually visits. Even one or two rounds of DAgger can dramatically improve
-robustness. See [Ross et al., 2011](https://arxiv.org/abs/1011.0686).
-
-### Action Chunking
-
-Instead of predicting one action per timestep, predict the next *K* actions at
-once and execute them open-loop before re-planning. This is the key idea behind
-ACT ([Zhao et al., 2023](https://arxiv.org/abs/2304.13705)) and directly fixes
-the jerky, temporally incoherent behavior of single-step BC. Fair warning, though, this will probably require a more sophisticated model (Transformer, Diffusion or other) to provide real benefits. Implementation is
-straightforward: widen the output head to `K * action_dim`, train with the same
-MSE loss over the full chunk, and add a small FIFO buffer at inference. Try
-sweeping K = 4, 8, 16 and compare smoothness and success rate.
-
-### Other Ideas
-- Gaussian Mixture Model for output logits. Can ameliorate the MSE multimodality issue.
-- Vision Transformer. Will need a beefier computer to see benefits but definitely can improve policy at scale.
-- Hooking in an existing VLM and experimenting with zero-shot inference.
+```
+┌──────────────────────────────────────────┐
+│          Diffusion Policy (ours)         │
+│  ConditionalUnet1D + DDPM + Normalizer   │
+├──────────────────────────────────────────┤
+│              RoboCasa                    │
+│  Kitchen scenes, OpenCabinet task logic  │
+│  Fixture management, 2500+ layouts       │
+├──────────────────────────────────────────┤
+│              robosuite                   │
+│  Robot models (PandaOmron), controllers  │
+│  Observation/action framework            │
+├──────────────────────────────────────────┤
+│          MuJoCo 3.3.1 (Physics)          │
+│  Contact dynamics, rendering, sensors    │
+└──────────────────────────────────────────┘
+```
 
 ---
 
 ## Troubleshooting
-
-I'll continually update this section as students find bugs in the system. Please, let me know if you encounter issues!
 
 | Problem | Solution |
 |---------|----------|
 | `MuJoCo version must be 3.3.1` | `pip install mujoco==3.3.1` |
 | `numpy version must be 2.2.5` | `pip install numpy==2.2.5` |
 | Rendering crashes on Mac | Use `mjpython` instead of `python` |
-| `GLFW error` on headless server | Set `export MUJOCO_GL=egl` or `osmesa` |
-| Out of GPU memory during training | Reduce batch size in `configs/diffusion_policy.yaml` |
-| Kitchen assets not found | Run `python -m robocasa.scripts.download_kitchen_assets` |
+| `GLFW error` on headless server | `export MUJOCO_GL=egl` or `osmesa` |
+| Out of GPU memory | Reduce `batch_size` (try 64 or 32) |
+| Kitchen assets not found | `python -m robocasa.scripts.download_kitchen_assets` |
+| `doors: n/a` in eval output | Update `07_evaluate_policy.py` to use `get_door_joint_states()` |
+| `TypeError: missing positional argument 'joint_names'` | Use direct MuJoCo joint reading instead of `env.fxtr.get_joint_state()` |
+| LeRobot action ordering mismatch | Ensure `reorder_action()` is applied before `env.step()` |
 
 ---
 
-## References
+## Acknowledgments
 
-- [RoboCasa Paper & Website](https://robocasa.ai/)
-- [RoboCasa GitHub](https://github.com/robocasa/robocasa)
-- [robosuite Documentation](https://robosuite.ai/)
-- [Diffusion Policy Paper](https://diffusion-policy.cs.columbia.edu/)
-- [MuJoCo Documentation](https://mujoco.readthedocs.io/)
-- [LeRobot Dataset Format](https://github.com/huggingface/lerobot)
+This project builds on the following open-source work:
+
+- **[RoboCasa](https://robocasa.ai/)** — Large-scale simulation benchmark for everyday robot tasks
+- **[robosuite](https://robosuite.ai/)** — Robot learning simulation framework
+- **[Diffusion Policy](https://diffusion-policy.cs.columbia.edu/)** (Chi et al., 2023) — Visuomotor policy learning via action diffusion
+- **[LeRobot](https://github.com/huggingface/lerobot)** (Hugging Face) — Robot learning dataset format and tools
+- **[MuJoCo](https://mujoco.readthedocs.io/)** — Physics simulation engine
+- **CS 188 Starter Code** by Holden GS (holdengs @ cs.ucla.edu)
+
+### GenAI Disclaimer
+
+Claude (Anthropic) was used via Claude Code CLI to assist with: debugging environment API issues, hyperparameter tuning guidance, and code modifications (door state monitoring, video recording). All training experiments, data collection, architectural decisions, and evaluations were performed by the team. 
