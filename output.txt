@@ -1,7 +1,12 @@
+(.venv) (base) DianaChu@Diana-MacBook-Pro cabinet_door_project % python 07_evaluate_policy.py \
+  --checkpoint checkpoints/best_diffusion_policy.pt
+[robosuite WARNING] Could not import robosuite_models. Some robots may not be available. If you want to use these robots, please install robosuite_models from source (https://github.com/ARISE-Initiative/robosuite_models) or through pip install. (__init__.py:30)
+[robosuite WARNING] Could not load the mink-based whole-body IK. Make sure you install related import properly (e.g. pip install mink==0.0.5), otherwise you will not be able to use the default IK controller setting for GR1 robot. (__init__.py:40)
+WARNING: mimicgen environments not imported since mimicgen is not installed!
 ============================================================
   OpenCabinet - Policy Evaluation
 ============================================================
-Device: cuda
+Device: cpu
 Success criterion: any door open
 Loaded Diffusion U-Net policy
   Trained for 498 epochs, loss=0.002275
@@ -12,140 +17,28 @@ Loaded Diffusion U-Net policy
 ============================================================
   Evaluating on pretrain split (20 episodes)
 ============================================================
-[robosuite INFO] Loading controller configuration from: /mnt/c/Users/abbie/Documents/cs188-cabinet-door-project/robosuite/robosuite/controllers/config/robots/default_pandaomron.json (composite_controller_factory.py:121)
-    [step   0] gripper=-1.000 eef_pos=0.909 eef_rot=0.375 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.654 eef_rot=0.025 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-0.999 eef_pos=0.700 eef_rot=0.281 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=-0.999 eef_pos=0.657 eef_rot=0.062 base=0.002 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.361 eef_rot=0.042 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.181 eef_rot=0.019 base=0.002 | doors: doorhinge=0.000
-    [step 300] gripper=-0.990 eef_pos=0.109 eef_rot=0.046 base=0.001 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.184 eef_rot=0.039 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step   0] gripper=-1.000 eef_pos=0.909 eef_rot=0.375 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.654 eef_rot=0.025 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-0.999 eef_pos=0.700 eef_rot=0.281 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=-0.999 eef_pos=0.657 eef_rot=0.062 base=0.002 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.361 eef_rot=0.042 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.181 eef_rot=0.019 base=0.002 | doors: doorhinge=0.000
-    [step 300] gripper=-0.990 eef_pos=0.109 eef_rot=0.046 base=0.001 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.184 eef_rot=0.039 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."       
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.654 eef_rot=0.025 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-0.999 eef_pos=0.700 eef_rot=0.281 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=-0.999 eef_pos=0.657 eef_rot=0.062 base=0.002 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.361 eef_rot=0.042 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.181 eef_rot=0.019 base=0.002 | doors: doorhinge=0.000
-    [step 300] gripper=-0.990 eef_pos=0.109 eef_rot=0.046 base=0.001 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.184 eef_rot=0.039 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."       
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.361 eef_rot=0.042 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.181 eef_rot=0.019 base=0.002 | doors: doorhinge=0.000
-    [step 300] gripper=-0.990 eef_pos=0.109 eef_rot=0.046 base=0.001 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.184 eef_rot=0.039 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."       
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.181 eef_rot=0.019 base=0.002 | doors: doorhinge=0.000
-    [step 300] gripper=-0.990 eef_pos=0.109 eef_rot=0.046 base=0.001 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.184 eef_rot=0.039 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."       
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 400] gripper=-0.994 eef_pos=0.242 eef_rot=0.049 base=0.002 | doors: doorhinge=0.000
-    [step 450] gripper=-0.979 eef_pos=0.044 eef_rot=0.031 base=0.002 | doors: doorhinge=0.000
-  Episode   1/20: FAIL    (steps= 500, reward=0.0) layout=53, style=37, task="Open the cabinet door."       
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step   0] gripper=-1.000 eef_pos=0.917 eef_rot=0.449 base=0.001 | doors: doorhinge=0.000
-    [step  50] gripper=-0.999 eef_pos=0.667 eef_rot=0.020 base=0.001 | doors: doorhinge=0.000
-    [step 100] gripper=-1.000 eef_pos=0.779 eef_rot=0.344 base=0.001 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 150] gripper=+0.994 eef_pos=1.228 eef_rot=0.109 base=0.001 | doors: doorhinge=0.000
-    [step 200] gripper=-1.000 eef_pos=0.402 eef_rot=0.054 base=0.002 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.153 eef_rot=0.045 base=0.001 | doors: doorhinge=0.000
-    [step 250] gripper=-1.000 eef_pos=0.429 eef_rot=0.040 base=0.001 | doors: doorhinge=0.000
-    [step 300] gripper=-1.000 eef_pos=0.195 eef_rot=0.059 base=0.000 | doors: doorhinge=0.000
-    [step 350] gripper=-1.000 eef_pos=0.153 eef_rot=0.045 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-1.000 eef_pos=0.229 eef_rot=0.064 base=0.001 | doors: doorhinge=0.000
-    [step 450] gripper=-0.994 eef_pos=0.091 eef_rot=0.027 base=0.001 | doors: doorhinge=0.000
-  Episode   2/20: FAIL    (steps= 500, reward=0.0) layout=53, style=20, task="Open the cabinet door."       
-    [step 350] gripper=-1.000 eef_pos=0.153 eef_rot=0.045 base=0.001 | doors: doorhinge=0.000
-    [step 400] gripper=-1.000 eef_pos=0.229 eef_rot=0.064 base=0.001 | doors: doorhinge=0.000
-    [step 450] gripper=-0.994 eef_pos=0.091 eef_rot=0.027 base=0.001 | doors: doorhinge=0.000
-  Episode   2/20: FAIL    (steps= 500, reward=0.0) layout=53, style=20, task="Open the cabinet door."       
-    [step   0] gripper=-0.997 eef_pos=0.736 eef_rot=0.272 base=0.002 | doors: leftdoorhinge=0.000, rightdoor    [step 400] gripper=-1.000 eef_pos=0.229 eef_rot=0.064 base=0.001 | doors: doorhinge=0.000
-    [step 450] gripper=-0.994 eef_pos=0.091 eef_rot=0.027 base=0.001 | doors: doorhinge=0.000
-  Episode   2/20: FAIL    (steps= 500, reward=0.0) layout=53, style=20, task="Open the cabinet door."       
-    [step   0] gripper=-0.997 eef_pos=0.736 eef_rot=0.272 base=0.002 | doors: leftdoorhinge=0.000, rightdoorhinge=0.000
-    [step   0] gripper=-0.997 eef_pos=0.736 eef_rot=0.272 base=0.002 | doors: leftdoorhinge=0.000, rightdoorhinge=0.000
-  Episode   5/20: SUCCESS (steps= 183, reward=1.0) layout=59, style=38, task="Open the cabinet door."
-  Episode   6/20: SUCCESS (steps= 163, reward=0.0) layout=47, style=43, task="Open the cabinet doors."
-  Episode   7/20: FAIL    (steps= 500, reward=0.0) layout=16, style=37, task="Open the cabinet doors."
-  Episode   8/20: FAIL    (steps= 500, reward=0.0) layout=40, style=13, task="Open the cabinet doors."
-  Episode   9/20: SUCCESS (steps= 184, reward=1.0) layout=46, style=34, task="Open the cabinet door."
-  Episode  10/20: SUCCESS (steps= 167, reward=0.0) layout=52, style=34, task="Open the cabinet doors."
-  Episode  11/20: SUCCESS (steps= 158, reward=0.0) layout=47, style=44, task="Open the cabinet doors."
-  Episode  12/20: FAIL    (steps= 500, reward=0.0) layout=60, style=12, task="Open the cabinet doors."
-  Episode  13/20: SUCCESS (steps= 229, reward=0.0) layout=14, style=24, task="Open the cabinet doors."
-  Episode  14/20: FAIL    (steps= 500, reward=0.0) layout=23, style=58, task="Open the cabinet doors."
-  Episode  15/20: FAIL    (steps= 500, reward=0.0) layout=13, style=51, task="Open the cabinet door."
-  Episode  16/20: FAIL    (steps= 500, reward=0.0) layout=51, style=31, task="Open the cabinet door."
-  Episode  17/20: SUCCESS (steps= 230, reward=1.0) layout=53, style=60, task="Open the cabinet door."
-  Episode  18/20: FAIL    (steps= 500, reward=0.0) layout=13, style=41, task="Open the cabinet doors."
-  Episode  19/20: SUCCESS (steps= 203, reward=0.0) layout=26, style=40, task="Open the cabinet doors."
-  Episode  20/20: FAIL    (steps= 500, reward=0.0) layout=26, style=58, task="Open the cabinet doors."
+Door open threshold: 90%
+[robosuite INFO] Loading controller configuration from: /Users/DianaChu/Downloads/cs188-cabinet-door-project/robosuite/robosuite/controllers/config/robots/default_pandaomron.json (composite_controller_factory.py:121)
+  Episode   1/20: FAIL    (steps= 500, reward=0.0, max_door=0.0%) layout=53, style=37, task="Open the cabinet door."
+  Episode   2/20: FAIL    (steps= 500, reward=0.0, max_door=0.0%) layout=53, style=20, task="Open the cabinet door."
+  Episode   3/20: FAIL    (steps= 500, reward=0.0, max_door=0.2%) layout=26, style=13, task="Open the cabinet doors."
+  Episode   4/20: SUCCESS (steps= 216, reward=1.0, max_door=91.3%) layout=55, style=46, task="Open the cabinet door."
+  Episode   5/20: SUCCESS (steps= 189, reward=1.0, max_door=90.2%) layout=59, style=38, task="Open the cabinet door."
+  Episode   6/20: SUCCESS (steps= 203, reward=0.0, max_door=91.5%) layout=47, style=43, task="Open the cabinet doors."
+  Episode   7/20: SUCCESS (steps= 246, reward=0.0, max_door=91.2%) layout=18, style=24, task="Open the cabinet doors."
+  Episode   8/20: FAIL    (steps= 500, reward=0.0, max_door=89.5%) layout=57, style=48, task="Open the cabinet door."
+  Episode   9/20: SUCCESS (steps= 358, reward=0.0, max_door=90.1%) layout=60, style=13, task="Open the cabinet doors."
+  Episode  10/20: FAIL    (steps= 500, reward=0.0, max_door=0.3%) layout=26, style=37, task="Open the cabinet doors."
+  Episode  11/20: SUCCESS (steps= 196, reward=0.0, max_door=90.1%) layout=14, style=39, task="Open the cabinet doors."
+  Episode  12/20: FAIL    (steps= 500, reward=0.0, max_door=14.1%) layout=56, style=15, task="Open the cabinet doors."
+  Episode  13/20: FAIL    (steps= 500, reward=0.0, max_door=16.6%) layout=60, style=56, task="Open the cabinet doors."
+  Episode  14/20: SUCCESS (steps= 227, reward=0.0, max_door=90.0%) layout=24, style=37, task="Open the cabinet doors."
+  Episode  15/20: SUCCESS (steps= 188, reward=1.0, max_door=91.4%) layout=39, style=27, task="Open the cabinet door."
+  Episode  16/20: FAIL    (steps= 500, reward=0.0, max_door=17.7%) layout=56, style=11, task="Open the cabinet door."
+  Episode  17/20: SUCCESS (steps= 210, reward=1.0, max_door=90.1%) layout=40, style=44, task="Open the cabinet door."
+  Episode  18/20: SUCCESS (steps= 167, reward=0.0, max_door=91.6%) layout=46, style=56, task="Open the cabinet doors."
+  Episode  19/20: FAIL    (steps= 500, reward=0.0, max_door=0.0%) layout=52, style=16, task="Open the cabinet door."
+  Episode  20/20: FAIL    (steps= 500, reward=0.0, max_door=0.5%) layout=60, style=21, task="Open the cabinet doors."
 
 ============================================================
   Evaluation Results
@@ -154,10 +47,13 @@ Loaded Diffusion U-Net policy
   Split:          pretrain
   Episodes:       20
   Success crit:   any door
-  Successes:      9/20
-  Success rate:   45.0%
-  Avg ep length:  361.8 steps
+  Successes:      10/20
+  Door threshold: 90%
+  Success rate:   50.0%
+  Avg ep length:  360.0 steps
   Avg reward:     0.200
+  Avg max door:   52.3%
+  Best max door:  91.6%
 
 ============================================================
   Performance Context
@@ -174,3 +70,4 @@ Expected success rates from the RoboCasa benchmark:
 Note: The simple MLP policy from Step 6 is not expected to
 achieve meaningful success rates. Use the diffusion policy
 (06_train_policy.py --diffusion) for real results.
+(.venv) (base) DianaChu@Diana-MacBook-Pro cabinet_door_project % 

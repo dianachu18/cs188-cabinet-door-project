@@ -6,11 +6,8 @@ using a 1D Convolutional U-Net with action chunking.
 
 The MLP baseline illustrates the data-loading -> training -> checkpoint
 pipeline but will not solve the task. The diffusion policy (--diffusion flag)
-uses a self-contained ConditionalUnet1D (~18M params) and can actually learn
-to open cabinet doors.
-
-This script is fully self-contained — it does NOT require the diffusion_policy
-package to be installed. All necessary modules are defined inline.
+uses the U-Net from the diffusion_policy repo and can actually learn to
+open cabinet doors.
 
 Prerequisites (for diffusion mode):
     python 04_download_dataset.py      # Download demonstrations
@@ -22,10 +19,8 @@ Usage:
 
     # Diffusion policy with 1D U-Net (recommended)
     python 06_train_policy.py --diffusion
-    python 06_train_policy.py --diffusion --epochs 350 --batch_size 128
-
-    # Quick local sanity check (small model, few epochs)
-    python 06_train_policy.py --diffusion --fast
+    python 06_train_policy.py --diffusion --config configs/diffusion_policy.yaml
+    python 06_train_policy.py --diffusion --epochs 200 --batch_size 128
 
     # Print instructions for official external repos
     python 06_train_policy.py --use_diffusion_policy
@@ -33,26 +28,17 @@ Usage:
 
 import argparse
 import copy
-import math
 import os
 import sys
-import time
 import yaml
-from typing import Dict, Union
 
 import numpy as np
 
-# =====================================================================
-#  Self-contained diffusion_policy modules (no package install needed)
-# =====================================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import einops
-from einops import reduce
-from einops.layers.torch import Rearrange
-from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+# Add diffusion_policy to path so we can import its modules
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DP_ROOT = os.path.join(SCRIPT_DIR, "diffusion_policy")
+if DP_ROOT not in sys.path:
+    sys.path.insert(0, DP_ROOT)
 
 
 def print_section(title):
@@ -60,499 +46,6 @@ def print_section(title):
     print(f"  {title}")
     print(f"{'=' * 60}")
 
-
-# --- utils ---
-def dict_apply(x, func):
-    return {
-        k: dict_apply(v, func) if isinstance(v, dict) else func(v)
-        for k, v in x.items()
-    }
-
-
-class ModuleAttrMixin(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._dummy_variable = nn.Parameter()
-
-    @property
-    def device(self):
-        return next(iter(self.parameters())).device
-
-    @property
-    def dtype(self):
-        return next(iter(self.parameters())).dtype
-
-
-class DictOfTensorMixin(nn.Module):
-    def __init__(self, params_dict=None):
-        super().__init__()
-        self.params_dict = (
-            params_dict if params_dict is not None else nn.ParameterDict()
-        )
-
-    @property
-    def device(self):
-        return next(iter(self.parameters())).device
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        def dfs_add(dest, keys, value):
-            if len(keys) == 1:
-                dest[keys[0]] = value
-                return
-            if keys[0] not in dest:
-                dest[keys[0]] = nn.ParameterDict()
-            dfs_add(dest[keys[0]], keys[1:], value)
-
-        out = nn.ParameterDict()
-        for key, value in state_dict.items():
-            if key.startswith(prefix + "params_dict"):
-                param_keys = key[len(prefix + "params_dict") :].split(".")[1:]
-                dfs_add(out, param_keys, value.clone())
-        self.params_dict = out
-        self.params_dict.requires_grad_(False)
-
-
-# --- Normalizer ---
-def _fit(
-    data,
-    last_n_dims=1,
-    dtype=torch.float32,
-    mode="limits",
-    output_max=1.0,
-    output_min=-1.0,
-    range_eps=1e-4,
-    fit_offset=True,
-):
-    if isinstance(data, np.ndarray):
-        data = torch.from_numpy(data)
-    if dtype:
-        data = data.type(dtype)
-    dim = int(np.prod(data.shape[-last_n_dims:])) if last_n_dims > 0 else 1
-    data = data.reshape(-1, dim)
-    input_min, _ = data.min(0)
-    input_max, _ = data.max(0)
-    input_mean = data.mean(0)
-    input_std = data.std(0)
-    if mode == "limits" and fit_offset:
-        r = input_max - input_min
-        ign = r < range_eps
-        r[ign] = output_max - output_min
-        scale = (output_max - output_min) / r
-        offset = output_min - scale * input_min
-        offset[ign] = (output_max + output_min) / 2 - input_min[ign]
-    else:
-        scale = torch.ones_like(input_mean)
-        offset = torch.zeros_like(input_mean)
-    p = nn.ParameterDict(
-        {
-            "scale": scale,
-            "offset": offset,
-            "input_stats": nn.ParameterDict(
-                {
-                    "min": input_min,
-                    "max": input_max,
-                    "mean": input_mean,
-                    "std": input_std,
-                }
-            ),
-        }
-    )
-    for x in p.parameters():
-        x.requires_grad_(False)
-    return p
-
-
-def _normalize(x, params, forward=True):
-    if isinstance(x, np.ndarray):
-        x = torch.from_numpy(x)
-    s, o = params["scale"], params["offset"]
-    x = x.to(device=s.device, dtype=s.dtype)
-    sh = x.shape
-    x = x.reshape(-1, s.shape[0])
-    x = x * s + o if forward else (x - o) / s
-    return x.reshape(sh)
-
-
-class SingleFieldLinearNormalizer(DictOfTensorMixin):
-    def normalize(self, x):
-        return _normalize(x, self.params_dict, True)
-
-    def unnormalize(self, x):
-        return _normalize(x, self.params_dict, False)
-
-
-class LinearNormalizer(DictOfTensorMixin):
-    @torch.no_grad()
-    def fit(self, data, **kw):
-        if isinstance(data, dict):
-            for k, v in data.items():
-                self.params_dict[k] = _fit(v, **kw)
-        else:
-            self.params_dict["_default"] = _fit(data, **kw)
-
-    def __getitem__(self, k):
-        return SingleFieldLinearNormalizer(self.params_dict[k])
-
-    def normalize(self, x):
-        if isinstance(x, dict):
-            return {
-                k: _normalize(v, self.params_dict[k], True) for k, v in x.items()
-            }
-        return _normalize(x, self.params_dict["_default"], True)
-
-    def unnormalize(self, x):
-        if isinstance(x, dict):
-            return {
-                k: _normalize(v, self.params_dict[k], False) for k, v in x.items()
-            }
-        return _normalize(x, self.params_dict["_default"], False)
-
-
-# --- Conv1D components ---
-class Downsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Upsample1d(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Conv1dBlock(nn.Module):
-    def __init__(self, inp, out, ks, n_groups=8):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv1d(inp, out, ks, padding=ks // 2),
-            nn.GroupNorm(n_groups, out),
-            nn.Mish(),
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        h = self.dim // 2
-        e = torch.exp(
-            torch.arange(h, device=x.device) * -(math.log(10000) / (h - 1))
-        )
-        e = x[:, None] * e[None, :]
-        return torch.cat((e.sin(), e.cos()), -1)
-
-
-# --- Conditional Residual Block ---
-class ConditionalResidualBlock1D(nn.Module):
-    def __init__(
-        self,
-        ic,
-        oc,
-        cond_dim,
-        kernel_size=3,
-        n_groups=8,
-        cond_predict_scale=False,
-    ):
-        super().__init__()
-        self.blocks = nn.ModuleList(
-            [
-                Conv1dBlock(ic, oc, kernel_size, n_groups),
-                Conv1dBlock(oc, oc, kernel_size, n_groups),
-            ]
-        )
-        cc = oc * 2 if cond_predict_scale else oc
-        self.cond_predict_scale = cond_predict_scale
-        self.out_channels = oc
-        self.cond_encoder = nn.Sequential(
-            nn.Mish(), nn.Linear(cond_dim, cc), Rearrange("b t -> b t 1")
-        )
-        self.residual_conv = nn.Conv1d(ic, oc, 1) if ic != oc else nn.Identity()
-
-    def forward(self, x, cond):
-        out = self.blocks[0](x)
-        emb = self.cond_encoder(cond)
-        if self.cond_predict_scale:
-            emb = emb.reshape(emb.shape[0], 2, self.out_channels, 1)
-            out = emb[:, 0] * out + emb[:, 1]
-        else:
-            out = out + emb
-        return self.blocks[1](out) + self.residual_conv(x)
-
-
-# --- Conditional U-Net 1D ---
-class ConditionalUnet1D(nn.Module):
-    def __init__(
-        self,
-        input_dim,
-        local_cond_dim=None,
-        global_cond_dim=None,
-        diffusion_step_embed_dim=256,
-        down_dims=[256, 512, 1024],
-        kernel_size=3,
-        n_groups=8,
-        cond_predict_scale=False,
-    ):
-        super().__init__()
-        all_dims = [input_dim] + list(down_dims)
-        dsed = diffusion_step_embed_dim
-        self.diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed),
-            nn.Linear(dsed, dsed * 4),
-            nn.Mish(),
-            nn.Linear(dsed * 4, dsed),
-        )
-        cond_dim = dsed + (global_cond_dim or 0)
-        in_out = list(zip(all_dims[:-1], all_dims[1:]))
-        kw = dict(
-            kernel_size=kernel_size,
-            n_groups=n_groups,
-            cond_predict_scale=cond_predict_scale,
-        )
-        self.local_cond_encoder = None
-        if local_cond_dim is not None:
-            _, d = in_out[0]
-            self.local_cond_encoder = nn.ModuleList(
-                [
-                    ConditionalResidualBlock1D(local_cond_dim, d, cond_dim, **kw),
-                    ConditionalResidualBlock1D(local_cond_dim, d, cond_dim, **kw),
-                ]
-            )
-        mid = all_dims[-1]
-        self.mid_modules = nn.ModuleList(
-            [
-                ConditionalResidualBlock1D(mid, mid, cond_dim, **kw),
-                ConditionalResidualBlock1D(mid, mid, cond_dim, **kw),
-            ]
-        )
-        self.down_modules = nn.ModuleList()
-        for i, (di, do) in enumerate(in_out):
-            self.down_modules.append(
-                nn.ModuleList(
-                    [
-                        ConditionalResidualBlock1D(di, do, cond_dim, **kw),
-                        ConditionalResidualBlock1D(do, do, cond_dim, **kw),
-                        Downsample1d(do) if i < len(in_out) - 1 else nn.Identity(),
-                    ]
-                )
-            )
-        self.up_modules = nn.ModuleList()
-        for i, (di, do) in enumerate(reversed(in_out[1:])):
-            self.up_modules.append(
-                nn.ModuleList(
-                    [
-                        ConditionalResidualBlock1D(do * 2, di, cond_dim, **kw),
-                        ConditionalResidualBlock1D(di, di, cond_dim, **kw),
-                        Upsample1d(di) if i < len(in_out) - 1 else nn.Identity(),
-                    ]
-                )
-            )
-        self.final_conv = nn.Sequential(
-            Conv1dBlock(down_dims[0], down_dims[0], kernel_size),
-            nn.Conv1d(down_dims[0], input_dim, 1),
-        )
-
-    def forward(self, sample, timestep, local_cond=None, global_cond=None, **kwargs):
-        sample = einops.rearrange(sample, "b h t -> b t h")
-        ts = (
-            timestep
-            if torch.is_tensor(timestep)
-            else torch.tensor([timestep], dtype=torch.long, device=sample.device)
-        )
-        if len(ts.shape) == 0:
-            ts = ts[None]
-        ts = ts.expand(sample.shape[0])
-        gf = self.diffusion_step_encoder(ts)
-        if global_cond is not None:
-            gf = torch.cat([gf, global_cond], -1)
-        hl = []
-        if local_cond is not None:
-            lc = einops.rearrange(local_cond, "b h t -> b t h")
-            hl = [
-                self.local_cond_encoder[0](lc, gf),
-                self.local_cond_encoder[1](lc, gf),
-            ]
-        x, h = sample, []
-        for i, (r1, r2, ds) in enumerate(self.down_modules):
-            x = r1(x, gf)
-            if i == 0 and hl:
-                x = x + hl[0]
-            x = r2(x, gf)
-            h.append(x)
-            x = ds(x)
-        for m in self.mid_modules:
-            x = m(x, gf)
-        for i, (r1, r2, us) in enumerate(self.up_modules):
-            x = torch.cat((x, h.pop()), 1)
-            x = r1(x, gf)
-            if i == len(self.up_modules) and hl:
-                x = x + hl[1]
-            x = r2(x, gf)
-            x = us(x)
-        return einops.rearrange(self.final_conv(x), "b t h -> b h t")
-
-
-# --- Mask Generator ---
-class LowdimMaskGenerator(ModuleAttrMixin):
-    def __init__(
-        self,
-        action_dim,
-        obs_dim,
-        max_n_obs_steps=2,
-        fix_obs_steps=True,
-        action_visible=False,
-    ):
-        super().__init__()
-        self.action_dim = action_dim
-        self.obs_dim = obs_dim
-        self.max_n_obs_steps = max_n_obs_steps
-        self.fix_obs_steps = fix_obs_steps
-        self.action_visible = action_visible
-
-    @torch.no_grad()
-    def forward(self, shape, seed=None):
-        dev = self.device
-        B, T, D = shape
-        m = torch.zeros(shape, dtype=torch.bool, device=dev)
-        ia = m.clone()
-        ia[..., : self.action_dim] = True
-        io = ~ia
-        os_ = (
-            torch.full((B,), self.max_n_obs_steps, device=dev)
-            if self.fix_obs_steps
-            else torch.randint(1, self.max_n_obs_steps + 1, (B,), device=dev)
-        )
-        steps = torch.arange(T, device=dev).unsqueeze(0).expand(B, T)
-        return (steps.T < os_).T.unsqueeze(-1).expand(B, T, D) & io
-
-
-# --- Diffusion Policy ---
-class DiffusionUnetLowdimPolicy(ModuleAttrMixin):
-    def __init__(
-        self,
-        model,
-        noise_scheduler,
-        horizon,
-        obs_dim,
-        action_dim,
-        n_action_steps,
-        n_obs_steps,
-        num_inference_steps=None,
-        obs_as_global_cond=True,
-        pred_action_steps_only=False,
-        **kwargs,
-    ):
-        super().__init__()
-        self.model = model
-        self.noise_scheduler = noise_scheduler
-        self.normalizer = LinearNormalizer()
-        self.mask_generator = LowdimMaskGenerator(
-            action_dim=action_dim,
-            obs_dim=0 if obs_as_global_cond else obs_dim,
-            max_n_obs_steps=n_obs_steps,
-            fix_obs_steps=True,
-            action_visible=False,
-        )
-        self.horizon = horizon
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-        self.n_action_steps = n_action_steps
-        self.n_obs_steps = n_obs_steps
-        self.obs_as_global_cond = obs_as_global_cond
-        self.pred_action_steps_only = pred_action_steps_only
-        self.num_inference_steps = (
-            num_inference_steps or noise_scheduler.config.num_train_timesteps
-        )
-        self.kwargs = kwargs
-
-    def set_normalizer(self, n):
-        self.normalizer.load_state_dict(n.state_dict())
-
-    def conditional_sample(
-        self, cd, cm, local_cond=None, global_cond=None, generator=None, **kw
-    ):
-        traj = torch.randn_like(cd)
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.noise_scheduler.timesteps:
-            traj[cm] = cd[cm]
-            out = self.model(
-                traj, t, local_cond=local_cond, global_cond=global_cond
-            )
-            traj = self.noise_scheduler.step(
-                out, t, traj, generator=generator, **kw
-            ).prev_sample
-        traj[cm] = cd[cm]
-        return traj
-
-    def predict_action(self, obs_dict):
-        nobs = self.normalizer["obs"].normalize(obs_dict["obs"])
-        B, _, Do = nobs.shape
-        To = self.n_obs_steps
-        Da = self.action_dim
-        dev, dt = self.device, self.dtype
-        gc = nobs[:, :To].reshape(B, -1)
-        shape = (B, self.horizon, Da)
-        cd = torch.zeros(shape, device=dev, dtype=dt)
-        cm = torch.zeros_like(cd, dtype=torch.bool)
-        ns = self.conditional_sample(cd, cm, global_cond=gc, **self.kwargs)
-        ap = self.normalizer["action"].unnormalize(ns[..., :Da])
-        return {
-            "action": ap[:, To : To + self.n_action_steps],
-            "action_pred": ap,
-        }
-
-    def compute_loss(self, batch):
-        nb = self.normalizer.normalize(batch)
-        obs, action = nb["obs"], nb["action"]
-        gc = obs[:, : self.n_obs_steps, :].reshape(obs.shape[0], -1)
-        traj = action
-        cm = (
-            torch.zeros_like(traj, dtype=torch.bool)
-            if self.pred_action_steps_only
-            else self.mask_generator(traj.shape)
-        )
-        noise = torch.randn_like(traj)
-        ts = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (traj.shape[0],),
-            device=traj.device,
-        ).long()
-        noisy = self.noise_scheduler.add_noise(traj, noise, ts)
-        noisy[cm] = traj[cm]
-        pred = self.model(noisy, ts, global_cond=gc)
-        target = (
-            noise
-            if self.noise_scheduler.config.prediction_type == "epsilon"
-            else traj
-        )
-        loss = F.mse_loss(pred, target, reduction="none") * (~cm).float()
-        return reduce(loss, "b ... -> b (...)", "mean").mean()
-
-
-# =====================================================================
-#  Config helpers
-# =====================================================================
 
 def load_config(config_path):
     """Load training configuration from YAML file."""
@@ -583,7 +76,14 @@ def train_simple_policy(config):
     This is a simplified training loop to illustrate the pipeline.
     For real results, use --diffusion mode.
     """
-    from torch.utils.data import DataLoader, Dataset
+    try:
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, Dataset
+    except ImportError:
+        print("ERROR: PyTorch is required for training.")
+        print("Install with: pip install torch torchvision")
+        sys.exit(1)
 
     print_section("Simple Behavior Cloning Policy")
 
@@ -596,12 +96,22 @@ def train_simple_policy(config):
     print("\nLoading dataset...")
 
     class CabinetDemoDataset(Dataset):
+        """
+        Loads state-action pairs from the LeRobot-format dataset.
+
+        For simplicity, this uses only the low-dimensional state observations
+        (gripper qpos, base pose, eef pose) rather than images.
+        Full visuomotor training with images requires the Diffusion Policy repo.
+        """
+
         def __init__(self, dataset_path, max_episodes=None):
             import pyarrow.parquet as pq
 
             self.states = []
             self.actions = []
 
+            # The dataset path from get_ds_path may point to the lerobot dir directly
+            # or to the parent. Try both layouts.
             data_dir = os.path.join(dataset_path, "data")
             if not os.path.exists(data_dir):
                 data_dir = os.path.join(dataset_path, "lerobot", "data")
@@ -611,6 +121,7 @@ def train_simple_policy(config):
                     "Make sure you downloaded the dataset with 04_download_dataset.py"
                 )
 
+            # Load parquet files
             chunk_dir = os.path.join(data_dir, "chunk-000")
             if not os.path.exists(chunk_dir):
                 raise FileNotFoundError(f"Chunk directory not found: {chunk_dir}")
@@ -619,25 +130,24 @@ def train_simple_policy(config):
                 f for f in os.listdir(chunk_dir) if f.endswith(".parquet")
             )
             if not parquet_files:
-                raise FileNotFoundError(
-                    f"No parquet files found in {chunk_dir}"
-                )
+                raise FileNotFoundError(f"No parquet files found in {chunk_dir}")
 
             episodes_loaded = 0
             for pf in parquet_files:
                 table = pq.read_table(os.path.join(chunk_dir, pf))
                 df = table.to_pandas()
 
+                # Extract state and action columns
                 state_cols = [
                     c for c in df.columns if c.startswith("observation.state")
                 ]
                 action_cols = [
-                    c
-                    for c in df.columns
+                    c for c in df.columns
                     if c == "action" or c.startswith("action.")
                 ]
 
                 if not state_cols or not action_cols:
+                    # Try alternative column naming
                     state_cols = [
                         c
                         for c in df.columns
@@ -647,6 +157,7 @@ def train_simple_policy(config):
 
                 if state_cols and action_cols:
                     for _, row in df.iterrows():
+                        # Values may be numpy arrays (object columns) or scalars
                         state_parts = []
                         for c in state_cols:
                             val = row[c]
@@ -663,21 +174,17 @@ def train_simple_policy(config):
                                 action_parts.append(float(val))
 
                         if state_parts and action_parts:
-                            self.states.append(
-                                np.array(state_parts, dtype=np.float32)
-                            )
-                            self.actions.append(
-                                np.array(action_parts, dtype=np.float32)
-                            )
+                            self.states.append(np.array(state_parts, dtype=np.float32))
+                            self.actions.append(np.array(action_parts, dtype=np.float32))
 
                 episodes_loaded += 1
                 if max_episodes and episodes_loaded >= max_episodes:
                     break
 
             if len(self.states) == 0:
-                print(
-                    "WARNING: Could not extract state-action pairs from parquet files."
-                )
+                print("WARNING: Could not extract state-action pairs from parquet files.")
+                print("The dataset may use a different format.")
+                print("Generating synthetic demo data for illustration...")
                 self._generate_synthetic_data()
 
             self.states = np.array(self.states, dtype=np.float32)
@@ -688,6 +195,7 @@ def train_simple_policy(config):
             print(f"Action dim: {self.actions.shape[-1]}")
 
         def _generate_synthetic_data(self):
+            """Generate synthetic data for demonstration purposes."""
             rng = np.random.default_rng(42)
             for _ in range(1000):
                 state = rng.standard_normal(16).astype(np.float32)
@@ -749,9 +257,7 @@ def train_simple_policy(config):
     print(f"Batch size: {config['batch_size']}")
     print(f"LR:         {config['learning_rate']}")
 
-    checkpoint_dir = config.get(
-        "checkpoint_dir", "/tmp/cabinet_policy_checkpoints"
-    )
+    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_policy_checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     best_loss = float("inf")
@@ -779,9 +285,7 @@ def train_simple_policy(config):
         avg_loss = epoch_loss / max(num_batches, 1)
 
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(
-                f"  Epoch {epoch + 1:4d}/{config['epochs']}  Loss: {avg_loss:.6f}"
-            )
+            print(f"  Epoch {epoch + 1:4d}/{config['epochs']}  Loss: {avg_loss:.6f}")
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -798,6 +302,7 @@ def train_simple_policy(config):
                 ckpt_path,
             )
 
+    # Save final checkpoint
     final_path = os.path.join(checkpoint_dir, "final_policy.pt")
     torch.save(
         {
@@ -830,44 +335,39 @@ def train_simple_policy(config):
 # =====================================================================
 
 def get_diffusion_default_config():
-    """Default hyperparameters for diffusion policy training.
-
-    These match the Colab training notebook that produced working results
-    (robot reaches handle, grasps, and pulls door open).
-    """
+    """Default hyperparameters for diffusion policy training."""
     return {
         # Temporal parameters
         "horizon": 16,
         "n_obs_steps": 2,
-        "n_action_steps": 2,  # short chunks = frequent replanning
+        "n_action_steps": 8,
         # Diffusion parameters
         "num_diffusion_iters": 100,
         "num_inference_iters": 16,
         "beta_schedule": "squaredcos_cap_v2",
-        # U-Net architecture (~18M params)
-        "down_dims": [128, 256, 512],
-        "kernel_size": 5,  # wider temporal receptive field
+        # U-Net architecture
+        "down_dims": [256, 512, 1024],
+        "kernel_size": 3,
         "n_groups": 8,
         "diffusion_step_embed_dim": 256,
         "cond_predict_scale": True,
         # Training
-        "epochs": 350,
-        "batch_size": 128,
+        "epochs": 500,
+        "batch_size": 64,
         "learning_rate": 1e-4,
         "weight_decay": 1e-6,
         "ema_decay": 0.995,
         "lr_warmup_steps": 500,
         "grad_clip_norm": 1.0,
-        # Data augmentation
-        "obs_noise_std": 0.01,  # Gaussian noise on observations
         # Paths
         "checkpoint_dir": "/tmp/cabinet_diffusion_checkpoints",
     }
 
 
-def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.0):
+def build_diffusion_dataset(dataset_path, horizon, n_obs_steps):
     """Build a temporal-window dataset from parquet files for diffusion training."""
     import pyarrow.parquet as pq
+    import torch
     from torch.utils.data import Dataset
 
     # Try augmented data first, fall back to raw
@@ -894,14 +394,16 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
         sys.exit(1)
 
     # Load all episodes
-    all_obs = []
-    all_actions = []
+    all_obs = []  # list of (T, obs_dim) arrays per episode
+    all_actions = []  # list of (T, action_dim) arrays per episode
 
     for pf in parquet_files:
         table = pq.read_table(os.path.join(data_dir, pf))
         df = table.to_pandas()
 
+        # Extract observation state columns
         state_cols = [c for c in df.columns if c.startswith("observation.state")]
+        # Add augmented columns if available
         aug_cols = []
         for aug_name in [
             "observation.handle_pos",
@@ -921,6 +423,7 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
         if not obs_cols or not action_cols:
             continue
 
+        # Build observation and action arrays for this episode
         ep_obs = []
         ep_actions = []
         for _, row in df.iterrows():
@@ -956,15 +459,12 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
     action_dim = all_actions[0].shape[-1]
 
     print(f"Loaded {len(all_obs)} episodes")
-    print(
-        f"Obs dim: {obs_dim} (state={len(state_cols)} cols + augmented={len(aug_cols)} cols)"
-    )
+    print(f"Obs dim: {obs_dim} (state={len(state_cols)} cols + augmented={len(aug_cols)} cols)")
     print(f"Action dim: {action_dim}")
-    if obs_noise_std > 0:
-        print(f"Obs noise augmentation: std={obs_noise_std}")
 
     # Build temporal window indices
-    indices = []
+    # Each sample: obs[t-n_obs+1:t+1], action[t:t+horizon]
+    indices = []  # (episode_idx, timestep)
     for ep_idx, ep in enumerate(all_obs):
         T = len(ep)
         for t in range(n_obs_steps - 1, T - horizon + 1):
@@ -981,7 +481,6 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
             self.action_dim = action_dim
             self.horizon = horizon
             self.n_obs_steps = n_obs_steps
-            self.obs_noise_std = obs_noise_std
 
         def __len__(self):
             return len(self.indices)
@@ -993,7 +492,7 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
 
             # Observation window: [t-n_obs+1, ..., t] -> (n_obs_steps, obs_dim)
             obs_start = t - self.n_obs_steps + 1
-            obs = ep_obs[obs_start : t + 1].copy()
+            obs = ep_obs[obs_start : t + 1]
 
             # Action window: [t, ..., t+horizon-1] -> (horizon, action_dim)
             action = ep_act[t : t + self.horizon]
@@ -1005,10 +504,6 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
                 )
                 action = np.concatenate([action, pad], axis=0)
 
-            # Observation noise augmentation for better generalization
-            if self.obs_noise_std > 0:
-                obs = obs + np.random.randn(*obs.shape).astype(np.float32) * self.obs_noise_std
-
             return {
                 "obs": torch.from_numpy(obs),
                 "action": torch.from_numpy(action),
@@ -1019,6 +514,8 @@ def build_diffusion_dataset(dataset_path, horizon, n_obs_steps, obs_noise_std=0.
 
 def save_diffusion_checkpoint(policy, config, obs_dim, action_dim, epoch, loss, path):
     """Save a diffusion policy checkpoint with all info needed to reconstruct."""
+    import torch
+
     torch.save(
         {
             "policy_type": "diffusion_unet",
@@ -1050,11 +547,17 @@ def train_diffusion_policy(config):
     """
     Train a diffusion policy with 1D U-Net and action chunking.
 
-    Uses a self-contained ConditionalUnet1D with global observation
-    conditioning and DDPM noise scheduling. No external diffusion_policy
-    package required.
+    Uses the ConditionalUnet1D from the diffusion_policy repo with
+    global observation conditioning and DDPM noise scheduling.
     """
+    import torch
     from torch.utils.data import DataLoader
+    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+    from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
+    from diffusion_policy.policy.diffusion_unet_lowdim_policy import (
+        DiffusionUnetLowdimPolicy,
+    )
+    from diffusion_policy.model.common.normalizer import LinearNormalizer
 
     print_section("Diffusion Policy Training (1D U-Net)")
 
@@ -1069,7 +572,6 @@ def train_diffusion_policy(config):
         dataset_path,
         horizon=config["horizon"],
         n_obs_steps=config["n_obs_steps"],
-        obs_noise_std=config.get("obs_noise_std", 0.0),
     )
 
     dataloader = DataLoader(
@@ -1113,6 +615,7 @@ def train_diffusion_policy(config):
         prediction_type="epsilon",
     )
 
+    # Global conditioning: obs is flattened and passed as global context
     global_cond_dim = obs_dim * config["n_obs_steps"]
 
     unet = ConditionalUnet1D(
@@ -1180,20 +683,14 @@ def train_diffusion_policy(config):
     print(f"Action steps:    {config['n_action_steps']}")
     print(f"Diffusion iters: {config['num_diffusion_iters']} (train) / {config['num_inference_iters']} (inference)")
     print(f"EMA decay:       {config['ema_decay']}")
-    print(f"U-Net dims:      {config['down_dims']}, kernel={config['kernel_size']}")
-    print(f"Obs noise:       {config.get('obs_noise_std', 0.0)}")
 
-    checkpoint_dir = config.get(
-        "checkpoint_dir", "/tmp/cabinet_diffusion_checkpoints"
-    )
+    checkpoint_dir = config.get("checkpoint_dir", "/tmp/cabinet_diffusion_checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     best_loss = float("inf")
     avg_loss = float("inf")
     ema_decay = config["ema_decay"]
     grad_clip = config.get("grad_clip_norm", 1.0)
-
-    t0 = time.time()
 
     for epoch in range(config["epochs"]):
         policy.train()
@@ -1224,52 +721,38 @@ def train_diffusion_policy(config):
 
         avg_loss = epoch_loss / max(num_batches, 1)
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
+        if (epoch + 1) % 10 == 0 or epoch == 0:
             lr = optimizer.param_groups[0]["lr"]
-            elapsed = (time.time() - t0) / 60
             print(
                 f"  Epoch {epoch + 1:4d}/{config['epochs']}  "
-                f"Loss: {avg_loss:.6f}  LR: {lr:.2e}  [{elapsed:.1f}m]"
+                f"Loss: {avg_loss:.6f}  LR: {lr:.2e}"
             )
 
         # Save best checkpoint
         if avg_loss < best_loss:
             best_loss = avg_loss
             save_diffusion_checkpoint(
-                ema_policy,
-                config,
-                obs_dim,
-                action_dim,
-                epoch,
-                best_loss,
+                ema_policy, config, obs_dim, action_dim,
+                epoch, best_loss,
                 os.path.join(checkpoint_dir, "best_diffusion_policy.pt"),
             )
 
         # Periodic checkpoint
         if (epoch + 1) % 100 == 0:
             save_diffusion_checkpoint(
-                ema_policy,
-                config,
-                obs_dim,
-                action_dim,
-                epoch,
-                avg_loss,
+                ema_policy, config, obs_dim, action_dim,
+                epoch, avg_loss,
                 os.path.join(checkpoint_dir, f"diffusion_policy_epoch{epoch + 1}.pt"),
             )
 
     # Final checkpoint
     save_diffusion_checkpoint(
-        ema_policy,
-        config,
-        obs_dim,
-        action_dim,
-        config["epochs"],
-        avg_loss,
+        ema_policy, config, obs_dim, action_dim,
+        config["epochs"], avg_loss,
         os.path.join(checkpoint_dir, "final_diffusion_policy.pt"),
     )
 
-    elapsed = (time.time() - t0) / 60
-    print(f"\nTraining complete! ({elapsed:.1f} min)")
+    print(f"\nTraining complete!")
     print(f"Best loss:        {best_loss:.6f}")
     print(f"Checkpoints in:   {checkpoint_dir}")
 
@@ -1277,12 +760,7 @@ def train_diffusion_policy(config):
     print(
         f"Evaluate your policy:\n"
         f"  python 07_evaluate_policy.py \\\n"
-        f"    --checkpoint {checkpoint_dir}/best_diffusion_policy.pt\n"
-        f"\n"
-        f"  # With relaxed threshold (recommended for 107-demo dataset):\n"
-        f"  python 07_evaluate_policy.py \\\n"
-        f"    --checkpoint {checkpoint_dir}/best_diffusion_policy.pt \\\n"
-        f"    --threshold 0.30"
+        f"    --checkpoint {checkpoint_dir}/best_diffusion_policy.pt"
     )
 
 
@@ -1334,18 +812,10 @@ def print_diffusion_policy_instructions():
 # =====================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train a policy for OpenCabinet"
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=None, help="Training epochs"
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=None, help="Batch size"
-    )
-    parser.add_argument(
-        "--lr", type=float, default=None, help="Learning rate"
-    )
+    parser = argparse.ArgumentParser(description="Train a policy for OpenCabinet")
+    parser.add_argument("--epochs", type=int, default=None, help="Training epochs")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
@@ -1364,33 +834,13 @@ def main():
         help="Train diffusion policy with 1D U-Net (recommended)",
     )
     parser.add_argument(
-        "--horizon",
-        type=int,
-        default=None,
-        help="Prediction horizon (diffusion mode)",
+        "--horizon", type=int, default=None, help="Prediction horizon (diffusion mode)"
     )
     parser.add_argument(
-        "--n_obs_steps",
-        type=int,
-        default=None,
-        help="Observation context steps (diffusion mode)",
+        "--n_obs_steps", type=int, default=None, help="Observation context steps (diffusion mode)"
     )
     parser.add_argument(
-        "--n_action_steps",
-        type=int,
-        default=None,
-        help="Action chunk size (diffusion mode)",
-    )
-    parser.add_argument(
-        "--obs_noise_std",
-        type=float,
-        default=None,
-        help="Observation noise std for augmentation (default 0.01)",
-    )
-    parser.add_argument(
-        "--fast",
-        action="store_true",
-        help="Use smaller model and fewer epochs for quick local testing",
+        "--n_action_steps", type=int, default=None, help="Action chunk size (diffusion mode)"
     )
     parser.add_argument(
         "--use_diffusion_policy",
@@ -1413,19 +863,7 @@ def main():
 
         if args.config:
             yaml_config = load_config(args.config)
-            config.update(
-                {k: v for k, v in yaml_config.items() if v is not None}
-            )
-
-        # --fast: small model for quick CPU sanity checks
-        if args.fast:
-            config["down_dims"] = [64, 128, 256]
-            config["diffusion_step_embed_dim"] = 128
-            config["num_diffusion_iters"] = 20
-            config["num_inference_iters"] = 5
-            config["epochs"] = 10
-            config["batch_size"] = 32
-            config["lr_warmup_steps"] = 50
+            config.update({k: v for k, v in yaml_config.items() if v is not None})
 
         # CLI overrides
         if args.epochs is not None:
@@ -1440,8 +878,6 @@ def main():
             config["n_obs_steps"] = args.n_obs_steps
         if args.n_action_steps is not None:
             config["n_action_steps"] = args.n_action_steps
-        if args.obs_noise_std is not None:
-            config["obs_noise_std"] = args.obs_noise_std
         if args.checkpoint_dir is not None:
             config["checkpoint_dir"] = args.checkpoint_dir
 
@@ -1455,8 +891,7 @@ def main():
                 "epochs": args.epochs or 50,
                 "batch_size": args.batch_size or 32,
                 "learning_rate": args.lr or 1e-4,
-                "checkpoint_dir": args.checkpoint_dir
-                or "/tmp/cabinet_policy_checkpoints",
+                "checkpoint_dir": args.checkpoint_dir or "/tmp/cabinet_policy_checkpoints",
             }
 
         train_simple_policy(config)
