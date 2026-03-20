@@ -1,0 +1,55 @@
+============================================================
+  OpenCabinet - Policy Evaluation
+============================================================
+Device: cuda
+  Episode   1/20: FAIL    (steps= 500, reward=0.0, max_door=0.0%) layout=53, style=37, task="Open the cabinet door."
+  Episode   2/20: SUCCESS (steps= 159, reward=1.0, max_door=91.1%) layout=46, style=53, task="Open the cabinet door."
+  Episode   3/20: SUCCESS (steps= 163, reward=1.0, max_door=91.3%) layout=56, style=17, task="Open the cabinet door."
+  Episode   4/20: SUCCESS (steps= 142, reward=0.0, max_door=90.0%) layout=25, style=51, task="Open the cabinet doors."
+  Episode   5/20: FAIL    (steps= 500, reward=0.0, max_door=0.6%) layout=15, style=19, task="Open the cabinet doors."
+  Episode   6/20: SUCCESS (steps= 320, reward=1.0, max_door=91.1%) layout=44, style=46, task="Open the cabinet door."
+  Episode   7/20: SUCCESS (steps= 175, reward=0.0, max_door=90.2%) layout=11, style=33, task="Open the cabinet doors."
+  Episode   8/20: FAIL    (steps= 500, reward=0.0, max_door=19.8%) layout=35, style=11, task="Open the cabinet doors."
+  Episode   9/20: SUCCESS (steps= 184, reward=0.0, max_door=90.5%) layout=42, style=18, task="Open the cabinet doors."
+  Episode  10/20: SUCCESS (steps= 158, reward=0.0, max_door=91.7%) layout=52, style=57, task="Open the cabinet doors."
+  Episode  11/20: FAIL    (steps= 500, reward=0.0, max_door=12.6%) layout=60, style=34, task="Open the cabinet doors."
+  Episode  12/20: SUCCESS (steps= 338, reward=0.0, max_door=91.8%) layout=51, style=28, task="Open the cabinet doors."
+  Episode  13/20: SUCCESS (steps= 241, reward=0.0, max_door=92.6%) layout=47, style=18, task="Open the cabinet doors."
+  Episode  14/20: FAIL    (steps= 500, reward=0.0, max_door=0.3%) layout=25, style=58, task="Open the cabinet door."
+  Episode  15/20: FAIL    (steps= 500, reward=0.0, max_door=0.0%) layout=16, style=31, task="Open the cabinet door."
+  Episode  16/20: FAIL    (steps= 500, reward=0.0, max_door=1.0%) layout=15, style=57, task="Open the cabinet doors."
+  Episode  17/20: FAIL    (steps= 500, reward=0.0, max_door=0.1%) layout=32, style=41, task="Open the cabinet door."
+  Episode  18/20: SUCCESS (steps= 138, reward=0.0, max_door=90.3%) layout=30, style=56, task="Open the cabinet doors."
+  Episode  19/20: FAIL    (steps= 500, reward=0.0, max_door=37.7%) layout=33, style=44, task="Open the cabinet doors."
+  Episode  20/20: SUCCESS (steps= 180, reward=1.0, max_door=90.2%) layout=55, style=24, task="Open the cabinet door."
+
+============================================================
+  Evaluation Results
+============================================================
+  Policy type:    diffusion_unet
+  Split:          pretrain
+  Episodes:       20
+  Success crit:   any door
+  Successes:      11/20
+  Door threshold: 90%
+  Success rate:   55.0%
+  Avg ep length:  334.9 steps
+  Avg reward:     0.200
+  Avg max door:   53.7%
+  Best max door:  92.6%
+
+============================================================
+  Performance Context
+============================================================
+Expected success rates from the RoboCasa benchmark:
+
+  Method            | Pretrain | Target
+  ------------------|----------|-------
+  Random actions    |    ~0%   |   ~0%
+  Diffusion Policy  |  ~30-60% | ~20-50%
+  pi-0              |  ~40-70% | ~30-60%
+  GR00T N1.5        |  ~35-65% | ~25-55%
+
+Note: The simple MLP policy from Step 6 is not expected to
+achieve meaningful success rates. Use the diffusion policy
+(06_train_policy.py --diffusion) for real results.

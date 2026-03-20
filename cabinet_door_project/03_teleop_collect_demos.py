@@ -74,6 +74,8 @@ if sys.platform == "linux" and "__TELEOP_DISPLAY_OK" not in os.environ:
 # ────────────────────────────────────────────────────────────────────────────
 
 import argparse
+import collections
+import importlib
 import time
 from copy import deepcopy
 
@@ -84,90 +86,98 @@ from robosuite.controllers import load_composite_controller_config
 from robosuite.wrappers import VisualizationWrapper
 
 
-# ── Policy loading (copied from 08_visualize_policy_rollout.py) ──────────
+# Import policy loading & state extraction from 07_evaluate_policy 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DP_ROOT = os.path.join(SCRIPT_DIR, "diffusion_policy")
+if DP_ROOT not in sys.path:
+    sys.path.insert(0, DP_ROOT)
 
+_eval_mod_path = os.path.join(SCRIPT_DIR, "07_evaluate_policy.py")
+_spec = importlib.util.spec_from_file_location("eval_policy", _eval_mod_path)
+_eval_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_eval_mod)
 
-def load_policy(checkpoint_path, device):
-    """Load the SimplePolicy trained by 06_train_policy.py."""
-    import torch
-    import torch.nn as nn
-
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dim = ckpt["state_dim"]
-    action_dim = ckpt["action_dim"]
-
-    class SimplePolicy(nn.Module):
-        def __init__(self, state_dim, action_dim, hidden_dim=256):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(state_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, action_dim),
-                nn.Tanh(),
-            )
-
-        def forward(self, state):
-            return self.net(state)
-
-    model = SimplePolicy(state_dim, action_dim).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    return model, state_dim, action_dim, ckpt
-
-
-def extract_state(obs, state_dim):
-    """Flatten non-image observations into a state vector of length state_dim."""
-    parts = []
-    for key in sorted(obs.keys()):
-        val = obs[key]
-        if isinstance(val, np.ndarray) and not key.endswith("_image"):
-            parts.append(val.flatten())
-    if not parts:
-        return np.zeros(state_dim, dtype=np.float32)
-    state = np.concatenate(parts).astype(np.float32)
-    if len(state) < state_dim:
-        state = np.pad(state, (0, state_dim - len(state)))
-    elif len(state) > state_dim:
-        state = state[:state_dim]
-    return state
-
-
-# ── DAgger helpers ───────────────────────────────────────────────────────
+load_policy = _eval_mod.load_policy
+LiveHandleAugmenter = _eval_mod.LiveHandleAugmenter
+extract_state = _eval_mod.extract_state
 
 
 def save_trajectory_parquet(trajectory, save_dir, episode_index):
     """
-    Save a list of {state, action} dicts as a parquet file.
+    Save a list of {state, action, aug_features} dicts as a parquet file.
 
-    The output schema matches what CabinetDemoDataset in 06_train_policy.py
-    expects: columns ``observation.state`` and ``action``.
+    The output schema matches what build_diffusion_dataset in 06_train_policy.py
+    expects: columns ``observation.state``, ``action``, and augmented observation
+    columns (handle_pos, handle_to_eef_pos, door_openness, handle_xaxis,
+    hinge_direction).
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     os.makedirs(save_dir, exist_ok=True)
 
-    states = [step["state"].tolist() for step in trajectory]
+    # Extract raw state (16D) and action (12D)
+    raw_states = [step["raw_state"].tolist() for step in trajectory]
     actions = [step["action"].tolist() for step in trajectory]
 
-    table = pa.table(
-        {
-            "observation.state": states,
-            "action": actions,
-        }
-    )
+    columns = {
+        "observation.state": raw_states,
+        "action": actions,
+    }
+
+    # Add augmented features as separate columns (matching 05b output format)
+    if trajectory[0].get("aug_features") is not None:
+        handle_pos = [step["aug_features"][:3].tolist() for step in trajectory]
+        handle_to_eef = [step["aug_features"][3:6].tolist() for step in trajectory]
+        door_openness = [step["aug_features"][6:7].tolist() for step in trajectory]
+        handle_xaxis = [step["aug_features"][7:10].tolist() for step in trajectory]
+        hinge_dir = [step["aug_features"][10:11].tolist() for step in trajectory]
+
+        columns["observation.handle_pos"] = handle_pos
+        columns["observation.handle_to_eef_pos"] = handle_to_eef
+        columns["observation.door_openness"] = door_openness
+        columns["observation.handle_xaxis"] = handle_xaxis
+        columns["observation.hinge_direction"] = hinge_dir
+
+    table = pa.table(columns)
 
     path = os.path.join(save_dir, f"episode_{episode_index:06d}.parquet")
     pq.write_table(table, path)
     return path
 
 
+def _env_action_to_lerobot(env_action):
+    """Reorder action from env/HDF5 format to LeRobot/parquet format.
+
+    Env format:     [eef_pos(3), eef_rot(3), gripper(1), base(4), mode(1)]
+    LeRobot format: [base(4), mode(1), eef_pos(3), eef_rot(3), gripper(1)]
+    """
+    lerobot_action = np.zeros(12, dtype=np.float32)
+    lerobot_action[0:4] = env_action[7:11]    # base_motion
+    lerobot_action[4:5] = env_action[11:12]   # control_mode
+    lerobot_action[5:8] = env_action[0:3]     # eef_position
+    lerobot_action[8:11] = env_action[3:6]    # eef_rotation
+    lerobot_action[11:12] = env_action[6:7]   # gripper_close
+    return lerobot_action
+
+
+def _lerobot_action_to_env(action):
+    """Reorder action from LeRobot/parquet format to env/HDF5 format.
+
+    LeRobot format: [base(4), mode(1), eef_pos(3), eef_rot(3), gripper(1)]
+    Env format:     [eef_pos(3), eef_rot(3), gripper(1), base(4), mode(1)]
+    """
+    env_action = np.zeros(12, dtype=np.float32)
+    env_action[0:3] = action[5:8]     # eef_position
+    env_action[3:6] = action[8:11]    # eef_rotation
+    env_action[6:7] = action[11:12]   # gripper_close
+    env_action[7:11] = action[0:4]    # base_motion
+    env_action[11:12] = action[4:5]   # control_mode
+    return env_action
+
+
 def collect_dagger_trajectory(
-    env, device, model, state_dim, action_dim, torch_device,
+    env, device, policy_info, torch_device,
     mirror_actions=True, max_fr=30,
 ):
     """
@@ -177,12 +187,26 @@ def collect_dagger_trajectory(
     keys, their input overrides the policy. All (state, action) pairs are
     recorded regardless of who was in control.
 
+    Supports both simple MLP and diffusion policy (with action chunking).
+
     Returns:
-        (success, trajectory): success bool and list of {state, action} dicts.
+        (success, trajectory): success bool and list of {raw_state, action,
+        aug_features} dicts. Actions are in LeRobot format for training
+        compatibility.
     """
     import torch
 
+    policy_type = policy_info["type"]
+    state_dim = policy_info["state_dim"]
+    action_dim = policy_info["action_dim"]
+    model = policy_info["model"]
+    n_obs_steps = policy_info.get("n_obs_steps", 1)
+    n_action_steps = policy_info.get("n_action_steps", 1)
+
     obs = env.reset()
+
+    # Initialize handle augmenter for this episode
+    augmenter = LiveHandleAugmenter(env)
 
     ep_meta = env.get_ep_meta()
     lang = ep_meta.get("lang", None)
@@ -209,18 +233,26 @@ def collect_dagger_trajectory(
 
     discard_traj = False
     trajectory = []
+    action_buffer = collections.deque()
+    obs_history = collections.deque(maxlen=n_obs_steps)
     step_count = 0
+    # Grace period: after human input, stay in human mode for this many steps
+    # so the policy doesn't immediately reclaim control (especially important
+    # for diffusion policy whose predict_action() call blocks briefly).
+    HUMAN_GRACE_STEPS = 30  # ~1 second at 30 fps
+    human_grace_remaining = 0
 
     while True:
         start = time.time()
 
         active_robot = env.robots[device_input.active_robot]
 
-        # Extract state for policy and recording
-        state = extract_state(obs, state_dim)
-
-        # Get human input
-        input_ac_dict = device_input.input2action(mirror_actions=mirror_actions)
+        # Get human input.  Use goal_update_mode="achieved" so the keyboard
+        # controller always references the robot's current position, not a
+        # stale target from before the policy was driving.
+        input_ac_dict = device_input.input2action(
+            mirror_actions=mirror_actions, goal_update_mode="achieved"
+        )
 
         if input_ac_dict is None:
             discard_traj = True
@@ -237,16 +269,29 @@ def collect_dagger_trajectory(
                 action_dict[arm] = input_ac_dict[f"{arm}_abs"]
 
         # Detect human activity: check if right_delta or base actions are non-zero
-        human_active = False
+        human_input_now = False
         right_delta = input_ac_dict.get("right_delta", None)
         if right_delta is not None and np.any(right_delta != 0):
-            human_active = True
+            human_input_now = True
         base_action = input_ac_dict.get("base", None)
         if base_action is not None and np.any(base_action != 0):
-            human_active = True
+            human_input_now = True
+
+        if human_input_now:
+            human_grace_remaining = HUMAN_GRACE_STEPS
+        elif human_grace_remaining > 0:
+            human_grace_remaining -= 1
+
+        human_active = human_input_now or human_grace_remaining > 0
+
+        # Compute state (with handle augmentation) for both policy and recording
+        aug_feats = augmenter.compute(env) if augmenter.handle_bodies else None
+        state = extract_state(obs, state_dim, augmented_features=aug_feats)
+        obs_history.append(state)
 
         if human_active:
-            # Human override: build action from human input
+            # Human override: build action from human input, clear action buffer
+            action_buffer.clear()
             env_action = [
                 robot.create_action_vector(all_prev_gripper_actions[i])
                 for i, robot in enumerate(env.robots)
@@ -256,33 +301,82 @@ def collect_dagger_trajectory(
             )
             env_action = np.concatenate(env_action)
         else:
-            # Policy drives: query the model
-            with torch.no_grad():
-                policy_action = model(
-                    torch.from_numpy(state).unsqueeze(0).to(torch_device)
-                ).cpu().numpy().squeeze(0)
+            # Policy drives
+            if len(action_buffer) == 0:
+                if policy_type == "simple_mlp":
+                    with torch.no_grad():
+                        state_t = torch.from_numpy(state).unsqueeze(0).to(torch_device)
+                        lerobot_action = model(state_t).cpu().numpy().squeeze(0)
+                    action_buffer.append(lerobot_action)
+                else:
+                    # Diffusion policy: build obs sequence and run inference
+                    while len(obs_history) < n_obs_steps:
+                        obs_history.appendleft(obs_history[0])
+
+                    obs_seq = np.stack(list(obs_history), axis=0)  # (n_obs, obs_dim)
+                    obs_tensor = (
+                        torch.from_numpy(obs_seq)
+                        .float()
+                        .unsqueeze(0)
+                        .to(torch_device)
+                    )  # (1, n_obs, obs_dim)
+
+                    with torch.no_grad():
+                        result = model.predict_action({"obs": obs_tensor})
+                        action_chunk = result["action"].cpu().numpy().squeeze(0)
+                        # action_chunk: (n_action_steps, action_dim)
+
+                    for a in action_chunk:
+                        action_buffer.append(a)
+
+            lerobot_action = action_buffer.popleft()
+
+            # Convert from LeRobot action order to env action order
+            env_action = _lerobot_action_to_env(lerobot_action)
 
             # Pad/trim to environment action dimension
             env_dim = env.action_dim
-            if len(policy_action) < env_dim:
-                policy_action = np.pad(policy_action, (0, env_dim - len(policy_action)))
-            elif len(policy_action) > env_dim:
-                policy_action = policy_action[:env_dim]
-            env_action = policy_action
+            if len(env_action) < env_dim:
+                env_action = np.pad(env_action, (0, env_dim - len(env_action)))
+            elif len(env_action) > env_dim:
+                env_action = env_action[:env_dim]
 
         # Step the environment
         obs, _, _, _ = env.step(env_action)
 
-        # Record (state, action) — trim action to action_dim for training
-        recorded_action = env_action[:action_dim]
-        trajectory.append({"state": state, "action": recorded_action})
+        # Record (raw_state, action in LeRobot format, aug_features)
+        # Raw state is the 16D proprioception without augmented features
+        RAW_STATE_KEYS = [
+            "robot0_base_pos", "robot0_base_quat",
+            "robot0_base_to_eef_pos", "robot0_base_to_eef_quat",
+            "robot0_gripper_qpos",
+        ]
+        raw_parts = []
+        for key in RAW_STATE_KEYS:
+            if key in obs and isinstance(obs[key], np.ndarray):
+                raw_parts.append(obs[key].flatten())
+        raw_state = np.concatenate(raw_parts).astype(np.float32) if raw_parts else np.zeros(16, dtype=np.float32)
+
+        # Convert env action to LeRobot format for saving
+        recorded_action = _env_action_to_lerobot(env_action[:12])
+
+        trajectory.append({
+            "raw_state": raw_state,
+            "action": recorded_action,
+            "aug_features": aug_feats,
+        })
 
         # Status line every 10 steps
         step_count += 1
         if step_count % 10 == 0:
-            who = "[HUMAN]" if human_active else "[policy]"
+            if human_input_now:
+                who = "[HUMAN]"
+            elif human_grace_remaining > 0:
+                who = f"[HUMAN grace={human_grace_remaining}]"
+            else:
+                who = "[policy]"
             print(f"\r  step {step_count:4d}  {who}  "
-                  f"traj_len={len(trajectory)}", end="", flush=True)
+                  f"traj_len={len(trajectory)}    ", end="", flush=True)
 
         # Check for task completion (15 consecutive success steps)
         if task_completion_hold_count == 0:
@@ -550,12 +644,14 @@ def main():
             sys.exit(1)
 
         torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model, state_dim, action_dim, ckpt = load_policy(args.checkpoint, torch_device)
+        policy_info = load_policy(args.checkpoint, torch_device)
 
         print(f"DAgger mode enabled")
-        print(f"  Checkpoint: {args.checkpoint}")
-        print(f"  Epoch {ckpt['epoch']}, loss {ckpt['loss']:.6f}")
-        print(f"  State dim: {state_dim},  Action dim: {action_dim}")
+        print(f"  Checkpoint:  {args.checkpoint}")
+        print(f"  Policy type: {policy_info['type']}")
+        print(f"  State dim: {policy_info['state_dim']},  Action dim: {policy_info['action_dim']}")
+        if policy_info["type"] == "diffusion_unet":
+            print(f"  Obs steps: {policy_info['n_obs_steps']}, Action steps: {policy_info['n_action_steps']}")
         print(f"  Save dir:  {args.save_dir}")
         print()
         print("The policy will drive the robot automatically.")
@@ -576,7 +672,7 @@ def main():
 
             if args.dagger:
                 success, trajectory = collect_dagger_trajectory(
-                    env, device, model, state_dim, action_dim, torch_device,
+                    env, device, policy_info, torch_device,
                     mirror_actions=True, max_fr=30,
                 )
                 if success and trajectory:
