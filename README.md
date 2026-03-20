@@ -2,7 +2,7 @@
 
 ### CS 188 — Introduction to Robotics | UCLA | Final Project
 
-A diffusion-based imitation learning system that trains a robot to open kitchen cabinet doors in the [RoboCasa](https://robocasa.ai/) simulation environment. The policy uses a **1D Convolutional U-Net** with **action chunking** and **DDPM noise scheduling** to learn from 107 human demonstrations, achieving **50% success rate** on the OpenCabinet task.
+A diffusion-based imitation learning system that trains a robot to open kitchen cabinet doors in the [RoboCasa](https://robocasa.ai/) simulation environment. The policy uses a **1D Convolutional U-Net** with **action chunking** and **DDPM noise scheduling** to learn from 133 human demonstrations, achieving **55% success rate** on the OpenCabinet task.
 
 ---
 
@@ -20,6 +20,7 @@ A diffusion-based imitation learning system that trains a robot to open kitchen 
   - [Step 6: Training](#step-6-training)
   - [Step 7: Evaluation](#step-7-evaluation)
   - [Step 8: Visualization](#step-8-visualization)
+  - [Step 9: DAgger (Interactive Improvement)](#step-9-dagger-interactive-improvement)
 - [Key Design Decisions](#key-design-decisions)
 - [Troubleshooting](#troubleshooting)
 - [Acknowledgments](#acknowledgments)
@@ -147,6 +148,7 @@ cs188-cabinet-door-project/
 │   ├── 06_train_policy.py                  # Train diffusion policy (local)
 │   ├── 07_evaluate_policy.py               # Evaluate policy + door openness
 │   ├── 08_visualize_policy_rollout.py      # Record per-episode rollout videos
+│   ├── copy_dagger.py                      # Copy DAgger episodes into training set
 │   │
 │   ├── configs/
 │   │   └── diffusion_policy.yaml           # Training hyperparameters
@@ -290,6 +292,48 @@ mjpython 08_visualize_policy_rollout.py \
 ```
 
 Saves individual episode videos (`episode_01.mp4`, etc.) and a combined `all_episodes.mp4` to `--video_dir` (default: `./rollout_videos/`).
+
+### Step 9: DAgger (Interactive Improvement)
+
+**DAgger (Dataset Aggregation)** is an iterative imitation learning technique that improves policy robustness by collecting human corrections on the trained policy's failures.
+
+**How it works:**
+1. The trained policy drives the robot autonomously
+2. When the policy makes mistakes, the human operator intervenes with keyboard corrections
+3. These corrective trajectories are saved as new training data
+4. The policy is retrained on the combined dataset (original demos + DAgger corrections)
+
+**Collecting DAgger episodes:**
+```bash
+# Run the policy with DAgger mode enabled (Mac: use mjpython)
+python 03_teleop_collect_demos.py \
+    --dagger \
+    --checkpoint checkpoints/best_diffusion_policy.pt
+```
+
+The policy will execute autonomously while you observe. Use the same keyboard controls as regular teleoperation to intervene when the robot struggles (e.g., missing the handle, moving in the wrong direction). DAgger episodes are saved to `data/dagger/chunk-000/`.
+
+**Adding DAgger data to the training set:**
+
+DAgger episodes must be copied into the augmented training directory with renumbered filenames to avoid overwriting existing episodes:
+
+```bash
+python copy_dagger.py
+```
+
+This copies the collected DAgger parquet files (e.g., `episode_000000.parquet` → `episode_000107.parquet`) into the augmented dataset directory alongside the original 107 expert demonstrations.
+
+**Retraining with DAgger data:**
+```bash
+python 06_train_policy.py --diffusion --epochs 500
+```
+
+The training script automatically picks up all parquet files in the augmented directory, including the newly added DAgger episodes.
+
+**Important considerations:**
+- DAgger records **all** timesteps (both policy-driven and human-corrected). Since the policy drives most of the episode, the DAgger data contains a mix of policy actions and expert corrections. A large number of DAgger episodes relative to expert demos can dilute the training signal.
+- Quality over quantity: fewer high-quality correction episodes targeting specific failure modes are more valuable than many full-length episodes.
+- We collected 26 DAgger episodes to supplement the 107 original expert demonstrations.
 
 ---
 
