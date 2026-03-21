@@ -405,7 +405,8 @@ class DiffusionUnetLowdimPolicy(ModuleAttrMixin):
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
         for t in self.noise_scheduler.timesteps:
             traj[cm] = cd[cm]
-            out = self.model(traj, t, local_cond=local_cond, global_cond=global_cond)
+            t_dev = t.to(cd.device)
+            out = self.model(traj, t_dev, local_cond=local_cond, global_cond=global_cond)
             traj = self.noise_scheduler.step(out, t, traj, generator=generator, **kw).prev_sample
         traj[cm] = cd[cm]
         return traj
@@ -759,7 +760,6 @@ def run_onscreen(policy_info, args):
         print(f"  Running for up to {args.max_steps} steps...")
 
         success = False
-        hold_count = 0
         max_openness = 0.0
         obs_history = collections.deque(maxlen=policy_info.get("n_obs_steps", 1))
         action_buffer = collections.deque()
@@ -776,18 +776,15 @@ def run_onscreen(policy_info, args):
                 max_openness = max(max_openness, max(door_states.values()))
 
             if step % 20 == 0:
-                checking = env._check_success()
-                status = "cabinet OPEN" if checking else "in progress"
+                door_str = f"{max_openness:.1%}" if door_states else "n/a"
+                status = "cabinet OPEN" if max_openness >= 0.90 else "in progress"
                 print(f"  step {step:4d}  reward={reward:+.3f}  "
-                      f"door={max_openness:.1%}  [{status}]")
+                      f"door={door_str}  [{status}]")
 
-            if env._check_success():
-                hold_count += 1
-                if hold_count >= 15:
-                    success = True
-                    break
-            else:
-                hold_count = 0
+            # Success = any door >= 90% open (same as 07_evaluate_policy)
+            if door_states and max(door_states.values()) >= 0.90:
+                success = True
+                break
 
             time.sleep(1.0 / args.max_fr)
 
@@ -812,6 +809,7 @@ def run_offscreen(policy_info, args):
         ...
     Plus a combined video with all episodes concatenated.
     """
+    import cv2
     import imageio
     from robocasa.utils.env_utils import create_env
 
@@ -819,6 +817,35 @@ def run_offscreen(policy_info, args):
     os.makedirs(video_dir, exist_ok=True)
 
     cam_h, cam_w = 512, 768
+
+    def add_text_overlay(frame, text, position=(10, 30), font_scale=0.8,
+                         color=(255, 255, 255), thickness=2, bg_color=(0, 0, 0)):
+        """Add text with a dark background for readability."""
+        frame = frame.copy()
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        x, y = position
+        cv2.rectangle(frame, (x - 4, y - th - 6), (x + tw + 4, y + baseline + 4),
+                      bg_color, cv2.FILLED)
+        cv2.putText(frame, text, (x, y), font, font_scale, color, thickness,
+                    cv2.LINE_AA)
+        return frame
+
+    def make_result_frame(width, height, episode, result_text):
+        """Create a frame showing SUCCESS or FAIL after an episode ends."""
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # Episode label
+        ep_text = f"Episode {episode}"
+        (ew, eh), _ = cv2.getTextSize(ep_text, font, 1.0, 2)
+        cv2.putText(frame, ep_text, ((width - ew) // 2, height // 2 - 40),
+                    font, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+        # Result text
+        color = (0, 255, 0) if result_text == "SUCCESS" else (0, 0, 255)
+        (rw, rh), _ = cv2.getTextSize(result_text, font, 2.0, 4)
+        cv2.putText(frame, result_text, ((width - rw) // 2, height // 2 + 40),
+                    font, 2.0, color, 4, cv2.LINE_AA)
+        return frame
 
     successes = 0
     all_frames = []
@@ -840,7 +867,6 @@ def run_offscreen(policy_info, args):
         print(f"  Layout:  {env.layout_id}   Style: {env.style_id}")
 
         success = False
-        hold_count = 0
         max_openness = 0.0
         ep_frames = []
         obs_history = collections.deque(maxlen=policy_info.get("n_obs_steps", 1))
@@ -853,10 +879,12 @@ def run_offscreen(policy_info, args):
             env_action = pad_action(reorder_action(action), env.action_dim)
             obs, reward, done, info = env.step(env_action)
 
-            # Render frame
+            # Render frame with overlay
             frame = env.sim.render(
                 height=cam_h, width=cam_w, camera_name="robot0_agentview_center"
             )[::-1]
+            label = f"Episode {ep + 1}/{args.num_episodes}  Step {step + 1}/{args.max_steps}"
+            frame = add_text_overlay(frame, label, position=(10, 30))
             ep_frames.append(frame)
 
             # Track door openness
@@ -865,18 +893,14 @@ def run_offscreen(policy_info, args):
                 max_openness = max(max_openness, max(door_states.values()))
 
             if step % 50 == 0:
-                checking = env._check_success()
-                status = "cabinet OPEN" if checking else "in progress"
                 door_str = f"{max_openness:.1%}" if door_states else "n/a"
+                status = "cabinet OPEN" if max_openness >= 0.90 else "in progress"
                 print(f"  step {step:4d}  door={door_str}  [{status}]")
 
-            if env._check_success():
-                hold_count += 1
-                if hold_count >= 15:
-                    success = True
-                    break
-            else:
-                hold_count = 0
+            # Success = any door >= 90% open (same as 07_evaluate_policy)
+            if door_states and max(door_states.values()) >= 0.90:
+                success = True
+                break
 
         result = "SUCCESS" if success else "FAIL"
         print(f"  Result: {result}  (max door: {max_openness:.1%}, {len(ep_frames)} frames)")
@@ -892,6 +916,11 @@ def run_offscreen(policy_info, args):
             "style": env.style_id,
             "task": lang,
         })
+
+        # Add result frames (show SUCCESS/FAIL for 2 seconds)
+        result_frame = make_result_frame(cam_w, cam_h, ep + 1, result)
+        for _ in range(args.fps * 2):
+            ep_frames.append(result_frame)
 
         # Save per-episode video
         ep_video_path = os.path.join(video_dir, f"episode_{ep + 1:02d}.mp4")
